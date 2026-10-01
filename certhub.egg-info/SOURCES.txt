@@ -1,8 +1,0 @@
-pyproject.toml
-certhub.egg-info/PKG-INFO
-certhub.egg-info/SOURCES.txt
-certhub.egg-info/dependency_links.txt
-certhub.egg-info/entry_points.txt
-certhub.egg-info/requires.txt
-certhub.egg-info/top_level.txt
-tests/test_core.py
