@@ -1,0 +1,136 @@
+Metadata-Version: 2.4
+Name: certhub
+Version: 1.0.0
+Summary: CertHub - automação de certidões públicas
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: playwright>=1.40.0
+Requires-Dist: httpx>=0.26.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: pydantic>=2.5.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: pytest>=7.4.4
+Requires-Dist: pytest-asyncio>=0.23.3
+Requires-Dist: loguru>=0.7.2
+Requires-Dist: requests>=2.31.0
+Requires-Dist: beautifulsoup4>=4.12.3
+Requires-Dist: lxml>=5.1.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: sqlalchemy>=2.0.25
+Requires-Dist: tenacity>=8.2.3
+Requires-Dist: pillow>=10.2.0
+Requires-Dist: opencv-python-headless>=4.9.0.80
+Requires-Dist: ddddocr>=1.5.6
+Requires-Dist: pytesseract>=0.3.10
+
+# 🚀 CertHub
+
+> Todas as certidões em um só lugar.
+
+CertHub é uma base modular para automação de emissão de certidões e documentos públicos brasileiros. O projeto já inclui a base comum, a CLI, o portal FGTS funcional e uma arquitetura pronta para extensão para os demais portais do ecossistema.
+
+## Status atual
+
+✅ Estrutura base do projeto
+✅ CLI funcionando
+✅ Validação de CPF/CNPJ
+✅ PDF Handler com hash
+✅ Portais do núcleo e Receita/Simples implementados em contrato uniforme
+✅ Portais CEIS/CNJ/TCU/Cartão CNPJ/SICAF padronizados
+✅ OCR e hCaptcha em módulos dedicados
+✅ Portal registry configurado
+✅ Testes automatizados cobrindo a base e a expansão dos portais
+✅ Suite atual validada: 17 testes passando
+
+## Portais disponíveis na base
+
+- FGTS / CRF
+- CNDT
+- Receita Federal CNPJ
+- Receita Federal CPF
+- Simples Nacional
+- CEIS / CGU
+- CNJ
+- TCU
+- Cartão CNPJ
+- SICAF / ComprasNet
+
+## Instalação
+
+```bash
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# Linux/Mac
+source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install -e .
+```
+
+## Uso
+
+```bash
+python -m certhub.main --version
+python -m certhub.main listar-portais
+python -m certhub.main emitir --portal fgts --documento 12.345.678/0001-95
+python -m certhub.main emitir --portal cndt --documento 12.345.678/0001-95
+python -m certhub.main emitir --portal receita_cnpj --documento 12.345.678/0001-95
+python -m certhub.main emitir --portal receita_cpf --documento 529.982.247-25
+```
+
+## Estrutura do projeto
+
+```text
+CERT-HUB v1.0/
+├── config/
+│   ├── config.yaml
+│   └── .env.example
+├── docs/
+│   └── architecture.md
+├── src/
+│   └── certhub/
+│       ├── core/
+│       ├── portals/
+│       ├── solvers/
+│       ├── utils/
+│       ├── __init__.py
+│       ├── config.py
+│       └── main.py
+├── tests/
+│   ├── test_core.py
+│   ├── test_fgts.py
+│   ├── test_solvers.py
+│   ├── test_portals_registry.py
+│   └── test_docs_and_cli.py
+├── output/
+├── logs/
+├── requirements.txt
+├── README.md
+├── Dockerfile
+├── docker-compose.yml
+├── setup.sh
+├── examples/
+│   └── lista.csv
+└── pyproject.toml
+```
+
+## Regras e boas práticas implementadas
+
+- Validação de CPF/CNPJ com verificação oficial de dígitos.
+- Persistência de PDF em diretórios organizados por portal/documento/data.
+- Cálculo de hash SHA-256 dos arquivos.
+- Registro estrutural do resultado da emissão.
+- Retry simples e logging centralizado.
+- Módulos separados por responsabilidade.
+- CLI com versão, listagem de portais e comando de emissão.
+
+## Limitações
+
+A base já está funcional e testada para a arquitetura, para a geração de PDFs e para a expansão dos portais principais do projeto. Os portais com captcha real e acessos governamentais continuam exigindo integração adicional com Playwright, OCR em imagens reais, APIs de captcha e ajustes de layout específicos por site.
+
+## Licença
+
+Este projeto é entregue como base de automação educacional e operacional em ambiente controlado para uso interno e de desenvolvimento.

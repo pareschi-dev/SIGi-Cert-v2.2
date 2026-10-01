@@ -1,0 +1,2 @@
+[console_scripts]
+certhub = certhub.main:app

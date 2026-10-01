@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: certhub
+Version: 1.0.0
+Summary: CertHub - automação de certidões públicas
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: playwright>=1.40.0
+Requires-Dist: httpx>=0.26.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: pydantic>=2.5.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: pytest>=7.4.4
+Requires-Dist: pytest-asyncio>=0.23.3
+Requires-Dist: loguru>=0.7.2
+Requires-Dist: requests>=2.31.0
+Requires-Dist: beautifulsoup4>=4.12.3
+Requires-Dist: lxml>=5.1.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: sqlalchemy>=2.0.25
+Requires-Dist: tenacity>=8.2.3
+Requires-Dist: pillow>=10.2.0
+Requires-Dist: opencv-python-headless>=4.9.0.80
+Requires-Dist: ddddocr>=1.5.6
+Requires-Dist: pytesseract>=0.3.10

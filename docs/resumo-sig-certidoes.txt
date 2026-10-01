@@ -1,0 +1,85 @@
+SIG-CERTIDÕES
+Sistema Inteligente de Gestão
+
+RESUMO PARA APRESENTAÇÃO
+
+O QUE É O SISTEMA
+
+O SIG-Certidões é uma central que reúne serviços de consulta de certidões públicas em um único lugar.
+
+Ele permite consultar informações de pessoas e empresas usando CPF ou CNPJ. O usuário informa o documento, escolhe o serviço e clica em Consultar.
+
+CONSULTAS DISPONÍVEIS
+
+O sistema reúne 10 serviços oficiais:
+
+1. Compras.gov.br — acesso à conta e aos serviços oficiais.
+2. Receita Federal — Certidão de Pessoa Jurídica (CNPJ).
+3. Receita Federal — Certidão de Pessoa Física (CPF).
+4. Caixa Econômica Federal — Certificado de Regularidade do FGTS (CRF).
+5. Tribunal Superior do Trabalho — Certidão Negativa de Débitos Trabalhistas (CNDT).
+6. Conselho Nacional de Justiça — consulta de improbidade administrativa e inelegibilidade.
+7. Controladoria-Geral da União — Sistema de Certidões da CGU.
+8. Receita Federal — Comprovante de Inscrição e de Situação Cadastral do CNPJ.
+9. Tribunal de Contas da União — Certidão de Licitantes Inidôneos.
+10. Receita Federal — Consulta de Optantes pelo Simples Nacional.
+
+COMO O SISTEMA REALIZA AS CONSULTAS
+
+O SIG-Certidões realiza o encaminhamento das 10 consultas a partir de uma única tela. O usuário escolhe o serviço, informa o CPF ou CNPJ e clica em Consultar.
+
+Para cada serviço, o sistema identifica o portal oficial responsável e inicia o atendimento correspondente. Nos fluxos integrados, ele preenche os dados, acompanha as etapas e salva o PDF quando o documento é disponibilizado. Nos demais fluxos, ele abre o portal oficial já direcionado para o serviço correto, permitindo a continuidade imediata da consulta.
+
+Dessa forma, todas as 10 consultas são realizadas a partir do SIG-Certidões:
+
+- Compras.gov.br — acesso aos serviços oficiais.
+- Receita Federal — Certidão de Pessoa Jurídica (CNPJ).
+- Receita Federal — Certidão de Pessoa Física (CPF).
+- Caixa Econômica Federal — Certificado de Regularidade do FGTS (CRF).
+- Tribunal Superior do Trabalho — CNDT.
+- Conselho Nacional de Justiça — improbidade administrativa e inelegibilidade.
+- Controladoria-Geral da União — Sistema de Certidões.
+- Receita Federal — Comprovante de Inscrição e de Situação Cadastral do CNPJ.
+- Tribunal de Contas da União — Certidão de Licitantes Inidôneos.
+- Receita Federal — Consulta de Optantes pelo Simples Nacional.
+
+COMO USAR
+
+1. Escolha CPF ou CNPJ.
+2. Digite o número do documento.
+3. Marque uma ou mais consultas.
+4. Clique em Consultar ou Consultar selecionadas.
+5. Resolva alguma confirmação solicitada pelo portal, se necessário.
+6. Confira o documento emitido pelo órgão oficial.
+
+O QUE O SISTEMA FAZ
+
+- Reúne 10 serviços oficiais.
+- Valida CPF e CNPJ antes da consulta.
+- Permite selecionar uma ou várias consultas.
+- Abre os portais oficiais dos órgãos responsáveis.
+- Automatiza três tipos de consulta.
+- Salva documentos em PDF quando possível.
+- Organiza os documentos por consulta e serviço.
+- Mantém um histórico local das solicitações.
+- Ajuda a reduzir erros de preenchimento.
+
+SEGURANÇA
+
+Alguns sites pedem CAPTCHA ou outra confirmação de segurança. Essa etapa é feita pelo usuário no próprio site oficial.
+
+O sistema protege a exibição do CPF ou CNPJ no histórico. A certidão continua sendo emitida pelo órgão público responsável.
+
+FINALIDADE
+
+O objetivo é tornar o trabalho mais rápido, organizado e simples.
+
+O sistema reduz a necessidade de abrir vários sites, repetir os mesmos dados e procurar manualmente cada serviço.
+
+RESUMO EM UMA FRASE
+
+O SIG-Certidões é uma central que facilita a consulta de certidões oficiais, organiza os documentos e reduz o trabalho repetitivo da equipe.
+
+OBSERVAÇÃO
+
+A validade e o conteúdo da certidão devem sempre ser conferidos no site oficial do órgão emissor.
