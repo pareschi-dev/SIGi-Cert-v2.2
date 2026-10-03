@@ -1,203 +1,161 @@
-versao: 1.0
-agente: SIG-Certidoes
+versao: 2.0
+agente: SIGi Certidões
 principios:
-  - "Nunca burlar CAPTCHA. Sempre delegar ao humano."
-  - "Sempre abrir a URL oficial do órgão emissor."
-  - "Confirmar o CNPJ/CPF antes de enviar (validação de dígitos)."
-  - "Validar assinatura %PDF- antes de considerar sucesso."
-  - "Registrar hash SHA-256 do PDF e da consulta."
+  - "Usar somente os portais oficiais dos órgãos emissores."
+  - "Nunca contornar CAPTCHA; quando existir, solicitar intervenção humana assistida."
+  - "Validar CPF/CNPJ antes de enviar e mascarar documentos no histórico."
+  - "Só informar sucesso após obter um PDF real do portal, validar %PDF- e calcular SHA-256."
+  - "Todos os PDFs de uma consulta ficam lado a lado em uma única pasta de Downloads."
+
+downloads:
+  diretorio_base: "CERTHUB_DOWNLOADS_DIR (vazio = pasta Downloads do sistema)"
+  pasta_consulta: "{documento_digitos}_{YYYY-MM-DD}_{HH-MM-SS}"
+  arquivo: "{site_id}.pdf"
 
 portais:
-
-  # -----------------------------------------------------------
   - id: compras_gov
-    nome: "Compras.gov.br — Acesse sua Conta"
-    orgao: "Compras.gov.br (Ministério da Gestão)"
-    tipo: manual
-    url_inicial: "https://www.gov.br/compras/pt-br"
-    url_servico: "https://www.gov.br/compras/pt-br/acesso-a-sistemas"
-    login: true
-    caminho:
-      - "Abrir https://www.gov.br/compras/pt-br"
-      - "Clicar em 'Acesso a Sistemas' (menu superior)"
-      - "Escolher 'Compras.gov.br'"
-      - "Autenticar via gov.br (CPF/senha ou certificado digital)"
-      - "Após login, acessar área de consulta desejada"
-    observacoes:
-      - "Não emite certidão em si — é portal de login/serviços."
-      - "Exige conta gov.br (nível prata ou ouro para alguns módulos)."
-
-  # -----------------------------------------------------------
-  - id: receita_cnpj
-    nome: "Certidão de Pessoa Jurídica (CNPJ) — Receita Federal"
-    orgao: "Receita Federal do Brasil"
+    nome: "SICAF — Compras.gov.br"
+    orgao: "Compras.gov.br"
     tipo: automacao
-    url_inicial: "https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cnpj"
+    modo: TOKEN
+    implementado: true
+    url_inicial: "https://www3.comprasnet.gov.br/sicaf-web/index.jsf"
+    observacoes: ["A automação aguarda autenticação do operador e gera PDF da certidão aberta no SICAF."]
+
+  - id: receita_cnpj
+    nome: "Certidão de Pessoa Jurídica (CNPJ)"
+    orgao: "Receita Federal"
+    tipo: automacao
+    modo: INTERNO
+    implementado: true
+    url_inicial: "https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cnpj#"
     seletores:
-      link_pessoa_juridica: "a:has-text('Pessoa Jurídica'), button:has-text('Pessoa Jurídica')"
-      campo_cnpj: "input[name='niContribuinte'], #niContribuinte"
-      botao_consultar_certidao: "button:has-text('Consultar Certidão'), a:has-text('Consultar Certidão')"
-      segunda_via: "text='2ª Via'"
-    caminho:
-      - "Abrir https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cnpj"
-      - "Preencher o campo CNPJ (formato 00.000.000/0000-00)"
-      - "Na home, clicar em 'Pessoa Jurídica'"
-      - "Clicar em 'Consultar Certidão'"
-      - "Na página de consulta, clicar novamente em 'Consultar Certidão'"
-      - "Na tabela de resultados, localizar a linha mais recente"
-      - "Clicar em '2ª Via' para baixar o PDF"
-      - "Resolver reCAPTCHA/hCaptcha na janela visível do portal"
-    validacao:
-      - "PDF deve começar com %PDF-"
-      - "Calcular SHA-256 do arquivo baixado"
+      campo_cnpj: "input[placeholder*='CNPJ' i], input[name='niContribuinte']"
+      botao_consultar_certidao: "button:has-text('Consultar Certidão')"
+      formulario_consulta: "input[placeholder='Selecione a data'], text=Data Inicial"
+      botao_consultar_periodo: "button:has-text('Consultar Certidão')"
+      resultados_consulta: "datatable-body-row, table tbody tr"
+      segunda_via_mais_recente: "datatable-body-row:first-child button[title='Segunda via']"
+      botao_emitir_certidao: "button:has-text('Emitir Certidão')"
+      botao_emitir_nova_certidao: "button:has-text('Emitir Nova Certidão')"
+      resultado_emissao: "text=A certidão foi emitida com sucesso"
+      download_pdf: "a[download^='Certidao-'], a:has-text('download do documento PDF da certidão')"
 
-  # -----------------------------------------------------------
   - id: receita_cpf
-    nome: "Certidão de Pessoa Física (CPF) — Receita Federal"
-    orgao: "Receita Federal do Brasil"
-    tipo: manual
-    url_inicial: "https://servicos.receita.fazenda.gov.br/servicos/certidaointernet/pf/emitir"
-    caminho:
-      - "Abrir https://servicos.receita.fazenda.gov.br/servicos/certidaointernet/pf/emitir"
-      - "Preencher CPF e data de nascimento"
-      - "Resolver CAPTCHA apresentado"
-      - "Clicar em 'Emitir Certidão'"
-      - "Baixar o PDF gerado"
-    observacoes:
-      - "Exige data de nascimento além do CPF."
-      - "CAPTCHA simples de imagem."
+    nome: "Certidão de Pessoa Física (CPF)"
+    orgao: "Receita Federal"
+    tipo: automacao
+    modo: INTERNO
+    implementado: true
+    url_inicial: "https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cpf#"
+    seletores:
+      campo_cpf: "input[placeholder*='CPF' i]"
+      campo_data_nascimento: "input[placeholder*='Nascimento' i]"
+      botao_consultar_certidao: "button:has-text('Consultar Certidão')"
+      segunda_via: "table tbody tr:first-child td:last-child button"
 
-  # -----------------------------------------------------------
   - id: fgts_crf
-    nome: "Certificado de Regularidade do FGTS (CRF) — Caixa"
+    nome: "Certificado de Regularidade do FGTS"
     orgao: "Caixa Econômica Federal"
     tipo: automacao
+    modo: VISÍVEL
+    implementado: true
     url_inicial: "https://consulta-crf.caixa.gov.br/consultacrf/pages/consultaEmpregador.jsf"
     seletores:
+      tipo_inscricao: "select[id='mainForm:tipoEstabelecimento']"
       campo_inscricao: "input[id='mainForm:txtInscricao1']"
-      campo_uf: "input[id='mainForm:uf']"
-      botao_consultar: "input[id='mainForm:btnConsultar'], text='Consultar'"
-      link_crf: "a:has-text('Certificado de Regularidade')"
-      botao_visualizar: "text='Visualizar'"
-      botao_imprimir: "text='Imprimir'"
-    caminho:
-      - "Abrir https://consulta-crf.caixa.gov.br/consultacrf/pages/consultaEmpregador.jsf"
-      - "Preencher 'Inscrição' (CNPJ) — SOMENTE DÍGITOS, sem pontuação"
-      - "Deixar UF em branco quando aplicável"
-      - "Clicar em 'Consultar'"
-      - "Localizar o link 'Certificado de Regularidade do FGTS — CRF'"
-      - "Clicar em 'Visualizar'"
-      - "Clicar em 'Imprimir'"
-      - "Salvar como PDF (geração automática do navegador)"
-    validacao:
-      - "Verificar assinatura %PDF-"
-      - "Calcular SHA-256"
+      campo_uf: "select[id='mainForm:uf']"
+      botao_consultar: "input[id='mainForm:btnConsultar']"
+      link_crf: "a:has-text('Certificado de Regularidade do FGTS - CRF')"
+      botao_visualizar: "role=button[name='Visualizar']"
 
-  # -----------------------------------------------------------
   - id: cndt
-    nome: "Certidão Negativa de Débitos Trabalhistas (CNDT) — TST"
+    nome: "Certidão Negativa de Débitos Trabalhistas"
     orgao: "Tribunal Superior do Trabalho"
-    tipo: manual
-    url_inicial: "https://cndt-certidao.tst.jus.br/inicio.do"
-    caminho:
-      - "Abrir https://cndt-certidao.tst.jus.br/inicio.do"
-      - "Aceitar/confirmar termos iniciais, se houver"
-      - "Escolher tipo: CPF ou CNPJ"
-      - "Preencher o número do documento"
-      - "Resolver CAPTCHA de imagem"
-      - "Clicar em 'Emitir certidão'"
-      - "Baixar o PDF gerado"
+    tipo: automacao
+    modo: VISÍVEL/CAPTCHA
+    implementado: true
+    url_inicial: "https://cndt-certidao.tst.jus.br/"
+    seletores:
+      campo_documento: "#cpfCnpj"
+      botao_emitir: "#botao-emitir"
 
-  # -----------------------------------------------------------
   - id: cnj_improbidade
-    nome: "Improbidade Administrativa e Inelegibilidade — CNJ"
+    nome: "Improbidade Administrativa e Inelegibilidade"
     orgao: "Conselho Nacional de Justiça"
     tipo: automacao
-    url_inicial: "https://www.cnj.jus.br/improbidade_adm/consultar_requerido.php"
+    modo: INTERNO
+    implementado: true
+    url_inicial: "https://www.cnj.jus.br/improbidade_adm/consultar_requerido.php?validar=form"
     seletores:
-      campo_documento: "#num_cpf_cnpj"
-      botao_pesquisar: "#btnPesquisarRequerido"
-      botao_certidao_negativa: "#btnCertidaoNegativa"
-    caminho:
-      - "Abrir https://www.cnj.jus.br/improbidade_adm/consultar_requerido.php"
-      - "Preencher #num_cpf_cnpj com CPF/CNPJ formatado"
-      - "Clicar em #btnPesquisarRequerido"
-      - "Aguardar resultado"
-      - "Se aparecer opção de certidão negativa: clicar em #btnCertidaoNegativa"
-      - "Salvar o PDF gerado"
-    observacoes:
-      - "Se houver condenação, o fluxo positivo deve ser reportado ao operador (não emite PDF automaticamente)."
+      campo_documento: "input[name='cpf_cnpj'], input[id='cpf_cnpj'], #num_cpf_cnpj"
+      botao_pesquisar: "input[value='Pesquisar'], #btnPesquisarRequerido"
+      botao_certidao_negativa: "input[value='Gerar Certidão Negativa'], #btnCertidaoNegativa"
 
-  # -----------------------------------------------------------
   - id: cgu_certidoes
-    nome: "Sistema de Certidões — CGU"
+    nome: "Certidão Negativa Correcional"
     orgao: "Controladoria-Geral da União"
-    tipo: manual
+    tipo: automacao
+    modo: VISÍVEL/CAPTCHA
+    implementado: true
     url_inicial: "https://certidoes.cgu.gov.br/"
-    caminho:
-      - "Abrir https://certidoes.cgu.gov.br/"
-      - "Selecionar o tipo de certidão (ex.: 'Certidão de Improbidade Administrativa', 'CEIS', 'CNEP')"
-      - "Informar CPF ou CNPJ"
-      - "Resolver CAPTCHA"
-      - "Emitir e baixar o PDF"
-    observacoes:
-      - "A CGU reúne vários tipos de certidão no mesmo portal."
+    seletores:
+      link_emitir_publico: "a[href='/consulta-certidao']"
+      radio_privado: "label.custom-control-label:has-text('Ente Privado'), input[type='radio'][value='0']"
+      checkbox_cert: "input[type='checkbox'][value='8']"
+      campo_documento: "#cpfCnpj"
+      botao_consultar: "button:has-text('Consultar')"
+      iframe_captcha: "iframe[src*='recaptcha']"
+      botao_certidao: "button:has-text('Certidão')"
 
-  # -----------------------------------------------------------
   - id: receita_cnpj_comprovante
-    nome: "Comprovante de Inscrição e de Situação Cadastral (CNPJ)"
-    orgao: "Receita Federal do Brasil"
-    tipo: manual
-    url_inicial: "https://solucoes.receita.fazenda.gov.br/servicos/cnpjreva/cnpjreva_solicitacao.asp"
-    caminho:
-      - "Abrir https://solucoes.receita.fazenda.gov.br/servicos/cnpjreva/cnpjreva_solicitacao.asp"
-      - "Preencher o CNPJ"
-      - "Resolver CAPTCHA"
-      - "Clicar em 'Consultar'"
-      - "Baixar o Comprovante (PDF) na tela de resultado"
+    nome: "Comprovante de Inscrição e Situação Cadastral"
+    orgao: "Receita Federal"
+    tipo: automacao
+    modo: VISÍVEL/CAPTCHA
+    implementado: true
+    url_inicial: "https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/"
+    seletores:
+      campo_cnpj: "input[mask='AA.AAA.AAA/AAAA-AA'], input[maxlength='18']"
+      iframe_hcaptcha: "iframe[title*='hCaptcha' i]"
+      botao_consultar: "input[value='CONSULTAR']"
 
-  # -----------------------------------------------------------
   - id: tcu_licitantes
-    nome: "Certidão de Licitantes Inidôneos — TCU"
+    nome: "Certidão de Licitantes Inidôneos"
     orgao: "Tribunal de Contas da União"
-    tipo: manual
-    url_inicial: "https://certidoes-apf.apps.tcu.gov.br/"
-    caminho:
-      - "Abrir https://certidoes-apf.apps.tcu.gov.br/"
-      - "Escolher 'Certidão de Licitantes Inidôneos'"
-      - "Informar CPF ou CNPJ"
-      - "Resolver CAPTCHA"
-      - "Emitir e baixar a certidão"
+    tipo: automacao
+    modo: INTERNO
+    implementado: true
+    url_inicial: "https://certidoes.apps.tcu.gov.br/emitir-certidao-inidoneos"
+    seletores:
+      campo_documento: "input[type='text']"
+      botao_toggle_cpf: "button[aria-label='Alternar consulta por CPF'], button:has-text('CPF')"
+      botao_emitir: "button:has-text('Emitir certidão')"
+      botao_baixar: "button:has-text('Baixar Certidão')"
 
-  # -----------------------------------------------------------
   - id: simples_nacional
-    nome: "Consulta Optantes pelo Simples Nacional — Receita Federal"
-    orgao: "Receita Federal do Brasil"
-    tipo: manual
-    url_inicial: "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes.aspx?id=21"
-    caminho:
-      - "Abrir https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes.aspx?id=21"
-      - "No menu 'Consulta', escolher 'Optantes' ou 'Consulta Optantes'"
-      - "Informar CNPJ"
-      - "Resolver CAPTCHA"
-      - "Verificar situação (optante / não optante / excluído)"
-    observacoes:
-      - "Esta consulta normalmente exibe resultado em tela, não gera PDF."
+    nome: "Consulta Optantes pelo Simples Nacional"
+    orgao: "Receita Federal"
+    tipo: automacao
+    modo: VISÍVEL
+    implementado: true
+    url_inicial: "https://www8.receita.fazenda.gov.br/simplesnacional/aplicacoes.aspx?id=21"
+    seletores:
+      campo_cnpj: "input[id*='cnpj' i]"
+      botao_consultar: "button:has-text('Consultar'), input[value='Consultar']"
+      marcador_resultado: "#btnMaisInfo, #GerarPDF, text=Situação Atual"
+      botao_mais_info: "#btnMaisInfo, button:has-text('Mais informações')"
+      botao_gerar_pdf: "#GerarPDF, button:has-text('Gerar PDF')"
 
-# -------------------------------------------------------------
 fluxo_global:
-  entrada:
-    - "tipo_documento: CPF | CNPJ"
-    - "documento: string (validado)"
-    - "certidoes_selecionadas: lista de ids"
+  entrada: ["tipo_documento: CPF | CNPJ", "documento: string validada", "certidoes_selecionadas: lista de IDs"]
   processamento:
-    - "Validar dígitos do CPF/CNPJ (algoritmo oficial)"
-    - "Normalizar (remover máscara) para envio; manter máscara para exibição"
-    - "Para cada portal selecionado:"
-    - "  - Se tipo == automacao: enviar para ThreadPoolExecutor"
-    - "  - Se tipo == manual: abrir URL em nova aba"
-    - "Persistir: consulta_id, site, status, eventos"
-    - "Transmitir progresso via WebSocket /api/v1/consultas/{id}/stream"
+    - "Validar os dígitos do CPF/CNPJ; manter o documento completo apenas em memória para a automação."
+    - "Criar uma pasta única {documento}_{data}_{hora} dentro de Downloads."
+    - "Passar a mesma pasta para todos os fluxos da consulta."
+    - "Executar somente fluxos marcados implementado=true; os demais falham como indisponíveis, sem abrir portal como substituto."
+    - "Transmitir status por portal via WebSocket; aguardar CAPTCHA humano quando aplicável."
   saida:
-    - "PDFs em output/consultas/{consulta_id}/{site}.pdf"
-    - "Histórico local com máscara + hash do documento"
+    - "Todos os PDFs lado a lado como {site_id}.pdf na pasta única de Downloads."
+    - "Validar a assinatura %PDF- e calcular SHA-256 antes de registrar sucesso."
+    - "Persistir somente documento mascarado/hash e metadados sem CPF/CNPJ em claro."

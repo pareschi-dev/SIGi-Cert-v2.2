@@ -3,13 +3,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from certhub.config import BASE_DIR
+
 
 def get_logger(name: str = "certhub") -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
 
-    log_dir = Path("./logs")
+    log_dir = BASE_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(log_dir / "certhub.log", encoding="utf-8")
     formatter = logging.Formatter(

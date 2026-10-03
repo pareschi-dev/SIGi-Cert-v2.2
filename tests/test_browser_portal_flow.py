@@ -15,7 +15,7 @@ def test_portal_can_navigate_and_detect_captcha_state():
     portal.close_browser()
 
 
-def test_fgts_emit_runs_browser_flow_before_pdf_generation():
+def test_legacy_fgts_emit_does_not_claim_to_run_a_certificate_flow():
     portal = FGTSPortal(EmissionRequest(portal="fgts", document="12.345.678/0001-95"))
     portal.url = (
         "data:text/html,<html><body>"
@@ -26,7 +26,7 @@ def test_fgts_emit_runs_browser_flow_before_pdf_generation():
 
     result = portal.emit()
 
-    assert result.success is True
-    assert result.pdf_path is not None
-    assert portal.browser_session.page is not None
+    assert result.success is False
+    assert result.pdf_path is None
+    assert portal.browser_session.page is None
     portal.close_browser()

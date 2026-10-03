@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 type Site = {
   codigo: string;
@@ -6,6 +6,7 @@ type Site = {
   orgao: string;
   captcha: string;
   url: string;
+  execution_mode: 'INTERNO' | 'VISÍVEL' | 'VISÍVEL/CAPTCHA' | 'TOKEN';
   document_types: ('CPF' | 'CNPJ')[];
   integration_configured: boolean;
 };
@@ -13,7 +14,7 @@ type Site = {
 type ConsultationSite = {
   codigo: string;
   status: string;
-  resultado: { erro?: string; arquivo?: string; pdf_sha256?: string } | null;
+  resultado: { erro?: string; arquivo?: string; pdf_sha256?: string; pdf_path?: string } | null;
 };
 
 type Consultation = {
@@ -22,6 +23,8 @@ type Consultation = {
   documento_mascarado: string;
   iniciado_em: string;
   status: string;
+  pasta_disponivel: boolean;
+  pasta_destino: string | null;
   sites: ConsultationSite[];
 };
 
@@ -29,9 +32,16 @@ type CaptchaPrompt = {
   captcha_id: string;
   site_codigo: string;
   consulta_id: string;
-  tipo: 'imagem' | 'recaptcha' | 'hcaptcha';
-  imagem_base64?: string;
+  tipo: 'imagem' | 'recaptcha' | 'hcaptcha' | 'token';
+  mensagem?: string;
 };
+
+export function addRecentCnpj(history: string[], cnpj: string): string[] {
+  const normalized = cnpj.trim();
+  const digits = normalized.replace(/\D/g, '');
+  if (!digits) return history;
+  return [normalized, ...history.filter(item => item.replace(/\D/g, '') !== digits)].slice(0, 5);
+}
 
 export function Dashboard() {
   const [sites, setSites] = useState<Site[]>([]);
@@ -39,14 +49,16 @@ export function Dashboard() {
   const [selectedSites, setSelectedSites] = useState<string[]>([]);
   const [documentType, setDocumentType] = useState<'CPF' | 'CNPJ'>('CNPJ');
   const [document, setDocument] = useState('');
+  const [recentCnpjs, setRecentCnpjs] = useState<string[]>([]);
+  const [showCnpjHistory, setShowCnpjHistory] = useState(false);
+  const [birthDate, setBirthDate] = useState('');
   const [notice, setNotice] = useState('');
   const [busySite, setBusySite] = useState('');
   const [activeConsultationIds, setActiveConsultationIds] = useState<string[]>([]);
-  const [captcha, setCaptcha] = useState<CaptchaPrompt | null>(null);
-  const [captchaAnswer, setCaptchaAnswer] = useState('');
-  const [manualSiteCodes, setManualSiteCodes] = useState<string[]>([]);
-  const downloadedCertificates = useRef(new Set<string>());
+  const [captchaPrompts, setCaptchaPrompts] = useState<CaptchaPrompt[]>([]);
+  const captcha = captchaPrompts[0] ?? null;
   const eligibleSites = sites.filter(site => site.document_types.includes(documentType));
+  const selectableSites = eligibleSites.filter(site => site.integration_configured);
   const automatedSiteCount = sites.filter(site => site.integration_configured).length;
 
   useEffect(() => {
@@ -82,22 +94,13 @@ export function Dashboard() {
       socket.onmessage = event => {
         const message = JSON.parse(event.data);
         if (message.evento === 'captcha_necessario') {
-          setCaptcha({ ...message, consulta_id: consultationId } as CaptchaPrompt);
-          setCaptchaAnswer('');
+          const prompt = { ...message, consulta_id: consultationId } as CaptchaPrompt;
+          setCaptchaPrompts(current => current.some(item => item.captcha_id === prompt.captcha_id)
+            ? current
+            : [...current, prompt]);
         }
         if (message.evento === 'site_concluido' && message.status === 'sucesso') {
-          const downloadKey = `${consultationId}:${message.site_codigo}`;
-          if (!downloadedCertificates.current.has(downloadKey)) {
-            downloadedCertificates.current.add(downloadKey);
-            const link = globalThis.document.createElement('a');
-            link.href = `/api/v1/consultas/${consultationId}/sites/${message.site_codigo}/pdf`;
-            link.download = `${message.site_codigo}.pdf`;
-            link.hidden = true;
-            globalThis.document.body.append(link);
-            link.click();
-            link.remove();
-            setNotice(`Certidão ${message.site_codigo} emitida; o download foi iniciado automaticamente.`);
-          }
+          setNotice(`Certidão ${message.site_codigo} salva na pasta única da consulta.`);
         }
         loadData().catch(error => setNotice(error.message));
       };
@@ -125,15 +128,16 @@ export function Dashboard() {
       const response = await fetch('/api/v1/consultas', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documento: document, tipo: documentType, sites: siteCodes }),
+        body: JSON.stringify({ documento: document, tipo: documentType, sites: siteCodes, ...(documentType === 'CPF' && siteCodes.includes('receita_inss_cpf') ? { data_nascimento: birthDate } : {}) }),
       });
       const payload = await response.json();
       if (!response.ok) {
         const detail = Array.isArray(payload.detail) ? payload.detail.map((item: { msg: string }) => item.msg).join(' ') : payload.detail;
         throw new Error(detail || 'Não foi possível iniciar a consulta.');
       }
+      if (documentType === 'CNPJ') setRecentCnpjs(current => addRecentCnpj(current, document));
       setActiveConsultationIds(current => [...new Set([...current, payload.consulta_id])]);
-      setNotice(`Consulta iniciada para ${siteCodes.length} certidão(ões) selecionada(s). Acompanhe as janelas dos portais.`);
+      setNotice(`Consulta iniciada para ${siteCodes.length} certidão(ões). Os portais internos rodam em modo invisível; desafios assistidos aparecem aqui.`);
       await loadData();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Erro ao iniciar consulta.');
@@ -143,19 +147,9 @@ export function Dashboard() {
   }
 
   async function consultSelectedSites() {
-    const compatibleSelectedSites = selectedSites.filter(siteCode => {
-      const site = sites.find(item => item.codigo === siteCode);
-      return site && site.document_types.includes(documentType);
-    });
-
-    const selectedManualSites = compatibleSelectedSites.filter(siteCode => !sites.find(site => site.codigo === siteCode)?.integration_configured);
-    const firstManualSite = sites.find(site => site.codigo === selectedManualSites[0]);
-    if (firstManualSite) window.open(firstManualSite.url, '_blank', 'noopener,noreferrer');
-    setManualSiteCodes(selectedManualSites);
-    if (selectedManualSites.length) {
-      setNotice('Um portal manual foi aberto. Abra os próximos individualmente pelos links oficiais abaixo.');
-    }
-    const selectedAutomatedSites = compatibleSelectedSites.filter(siteCode => sites.find(site => site.codigo === siteCode)?.integration_configured);
+    const selectedAutomatedSites = selectedSites.filter(siteCode =>
+      selectableSites.some(site => site.codigo === siteCode),
+    );
     if (selectedAutomatedSites.length) await startConsultation(selectedAutomatedSites);
   }
 
@@ -164,7 +158,18 @@ export function Dashboard() {
   }
 
   function toggleAllEligible() {
-    setSelectedSites(selectedSites.length === eligibleSites.length ? [] : eligibleSites.map(site => site.codigo));
+    setSelectedSites(selectedSites.length === selectableSites.length ? [] : selectableSites.map(site => site.codigo));
+  }
+
+  async function openConsultationFolder(consultationId: string) {
+    try {
+      const response = await fetch(`/api/v1/consultas/${consultationId}/abrir-pasta`, { method: 'POST' });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Não foi possível abrir a pasta.');
+      setNotice('Pasta da consulta aberta no Explorer.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Erro ao abrir a pasta da consulta.');
+    }
   }
 
   async function resolveCaptcha(event: React.FormEvent<HTMLFormElement>) {
@@ -174,13 +179,14 @@ export function Dashboard() {
       const response = await fetch(`/api/v1/consultas/${captcha.consulta_id}/captcha/${captcha.captcha_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resposta: captcha.tipo === 'imagem' ? captchaAnswer : 'concluido' }),
+        body: JSON.stringify({ resposta: 'concluido' }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || 'Não foi possível enviar a resposta.');
-      setCaptcha(null);
-      setCaptchaAnswer('');
-      setNotice('Resposta encaminhada ao portal. A consulta continuará automaticamente.');
+      setCaptchaPrompts(current => current.filter(item => item.captcha_id !== captcha.captcha_id));
+      setNotice(captcha.site_codigo === 'cndt'
+        ? 'Confirmação recebida. Aguardando o PDF emitido no portal do TST.'
+        : 'Confirmação recebida. A consulta continuará automaticamente.');
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Erro ao enviar resposta.');
     }
@@ -215,36 +221,71 @@ export function Dashboard() {
               <div className="panel-head"><h2 id="form-title">Documento</h2><span>CPF/CNPJ não é persistido em claro</span></div>
               <div className="panel-body">
                 <div className="field-row">
-                  <div className="field"><label htmlFor="tipo">Tipo</label><select id="tipo" value={documentType} onChange={event => { setDocumentType(event.target.value as 'CPF' | 'CNPJ'); setDocument(''); }}><option value="CNPJ">CNPJ</option><option value="CPF">CPF</option></select></div>
-                  <div className="field"><label htmlFor="documento">Documento</label><input id="documento" value={document} onChange={event => setDocument(event.target.value)} autoComplete="off" inputMode="numeric" placeholder={documentType === 'CPF' ? '000.000.000-00' : '00.000.000/0000-00'} /></div>
+                  <div className="field"><label htmlFor="tipo">Tipo</label><select id="tipo" value={documentType} onChange={event => { setDocumentType(event.target.value as 'CPF' | 'CNPJ'); setDocument(''); setBirthDate(''); }}><option value="CNPJ">CNPJ</option><option value="CPF">CPF</option></select></div>
+                  <div className={`field document-field${showCnpjHistory && documentType === 'CNPJ' && recentCnpjs.length ? ' history-open' : ''}`}>
+                    <label htmlFor="documento">Documento</label>
+                    <input
+                      id="documento"
+                      value={document}
+                      onChange={event => setDocument(event.target.value)}
+                      onFocus={() => setShowCnpjHistory(documentType === 'CNPJ' && recentCnpjs.length > 0)}
+                      onBlur={() => setShowCnpjHistory(false)}
+                      onKeyDown={event => { if (event.key === 'Escape') setShowCnpjHistory(false); }}
+                      autoComplete="off"
+                      inputMode="numeric"
+                      placeholder={documentType === 'CPF' ? '000.000.000-00' : '00.000.000/0000-00'}
+                      role="combobox"
+                      aria-autocomplete="list"
+                      aria-expanded={showCnpjHistory && documentType === 'CNPJ' && recentCnpjs.length > 0}
+                      aria-controls="recent-cnpj-list"
+                    />
+                    {showCnpjHistory && documentType === 'CNPJ' && recentCnpjs.length > 0 && (
+                      <div className="recent-cnpj-dropdown" id="recent-cnpj-list" role="listbox" aria-label="Últimos 5 CNPJs desta sessão">
+                        <div className="recent-cnpj-heading">Últimos CNPJs desta sessão</div>
+                        {recentCnpjs.map(cnpj => (
+                          <button
+                            className="recent-cnpj-option"
+                            key={cnpj.replace(/\D/g, '')}
+                            type="button"
+                            role="option"
+                            aria-selected={document === cnpj}
+                            onMouseDown={event => event.preventDefault()}
+                            onClick={() => { setDocument(cnpj); setShowCnpjHistory(false); }}
+                          >
+                            {cnpj}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="field-hint">Digite o documento; ele será enviado somente aos portais selecionados.</div>
+                {documentType === 'CPF' && <div className="field"><label htmlFor="data-nascimento">Data de nascimento (necessária para Receita CPF)</label><input id="data-nascimento" type="date" value={birthDate} onChange={event => setBirthDate(event.target.value)} /></div>}
                 {notice && <div className="notice" role="status">{notice}</div>}
               </div>
             </section>
             <section className="panel" aria-labelledby="sites-title">
-              <div className="panel-head"><h2 id="sites-title">Certidões disponíveis</h2><button className="text-button" type="button" onClick={toggleAllEligible}>{selectedSites.length === eligibleSites.length ? 'Desmarcar disponíveis' : 'Selecionar disponíveis'}</button></div>
+              <div className="panel-head"><h2 id="sites-title">Certidões disponíveis</h2><button className="text-button" type="button" disabled={!selectableSites.length} onClick={toggleAllEligible}>{selectedSites.length === selectableSites.length ? 'Desmarcar disponíveis' : 'Selecionar disponíveis'}</button></div>
               <div className="portal-list">
                 {eligibleSites.map(site => {
                   const compatible = site.document_types.includes(documentType);
                   const canRun = site.integration_configured && compatible && !busySite;
                   return (
                     <article className="portal-row" key={site.codigo}>
-                      <button className={`portal-select${selectedSites.includes(site.codigo) ? ' is-selected' : ''}`} type="button" role="checkbox" aria-checked={selectedSites.includes(site.codigo)} aria-label={`Selecionar ${site.nome}`} disabled={Boolean(busySite)} onClick={() => toggleSite(site.codigo)}>{selectedSites.includes(site.codigo) ? '✓' : ''}</button>
+                      <button className={`portal-select${selectedSites.includes(site.codigo) ? ' is-selected' : ''}`} type="button" role="checkbox" aria-checked={selectedSites.includes(site.codigo)} aria-label={`Selecionar ${site.nome}`} disabled={Boolean(busySite) || !canRun} title={!site.integration_configured ? 'Fluxo ainda em implementação; nenhuma consulta será iniciada.' : undefined} onClick={() => toggleSite(site.codigo)}>{selectedSites.includes(site.codigo) ? '✓' : ''}</button>
                       <div className="portal-details">
                         <strong>{site.nome}</strong>
                         <span className="site-org">{site.orgao}</span>
-                        <span className="portal-meta">{site.integration_configured ? '[AUTOMAÇÃO] ' : '[MANUAL] '}{site.captcha}</span>
+                        <span className="portal-meta">{site.integration_configured ? site.execution_mode : `Automação em implementação · ${site.execution_mode}`} · {site.captcha}</span>
                       </div>
                       <div className="portal-actions">
-                        {site.integration_configured ? <button className="primary small-button" type="button" disabled={!canRun} onClick={() => void startConsultation([site.codigo])}>Consultar</button> : <a className="primary small-button portal-button" href={site.url} target="_blank" rel="noreferrer" aria-label={`Consultar ${site.nome}`} title={`Consultar ${site.nome}`}>Consultar</a>}
+                        <button className="primary small-button" type="button" disabled={!canRun} title={!site.integration_configured ? 'Fluxo ainda em implementação.' : undefined} onClick={() => void startConsultation([site.codigo])}>{site.integration_configured ? 'Consultar' : 'Indisponível'}</button>
                       </div>
                     </article>
                   );
                 })}
               </div>
               <div className="selected-actions"><span>{selectedSites.length} certidão(ões) selecionada(s)</span><button className="primary" type="button" disabled={!selectedSites.length || Boolean(busySite)} onClick={() => void consultSelectedSites()}>Consultar selecionadas</button></div>
-              {manualSiteCodes.length > 0 && <div className="manual-links" role="region" aria-label="Portais manuais bloqueados"><strong>Abra os portais oficiais manualmente:</strong>{manualSiteCodes.map(siteCode => { const site = sites.find(item => item.codigo === siteCode); return site ? <a key={site.codigo} href={site.url} target="_blank" rel="noreferrer">{site.nome}</a> : null; })}</div>}
             </section>
             <section className="panel" aria-labelledby="recent-title">
               <div className="panel-head"><h2 id="recent-title">Histórico de consultas</h2><span>Últimas 25</span></div>
@@ -252,8 +293,8 @@ export function Dashboard() {
                 {!consultations.length && <div className="recent-empty">Nenhuma consulta iniciada ainda.</div>}
                 {consultations.map(consultation => (
                   <article className="recent-item" key={consultation.id}>
-                    <div className="recent-top"><div><div className="recent-doc">{consultation.documento_tipo} · {consultation.documento_mascarado}</div><div className="recent-time">{new Date(consultation.iniciado_em).toLocaleString('pt-BR')}</div></div></div>
-                    {consultation.sites.map(site => <div className="recent-site" key={site.codigo}><span>{sites.find(item => item.codigo === site.codigo)?.nome || site.codigo}</span></div>)}
+                    <div className="recent-top"><div><div className="recent-doc">{consultation.documento_tipo} · {consultation.documento_mascarado}</div><div className="recent-time">{new Date(consultation.iniciado_em).toLocaleString('pt-BR')} · {consultation.status}</div></div>{consultation.pasta_disponivel && <button className="text-button" type="button" onClick={() => void openConsultationFolder(consultation.id)}>Abrir pasta</button>}</div>
+                    {consultation.sites.map(site => <div className="recent-site" key={site.codigo}><span>{sites.find(item => item.codigo === site.codigo)?.nome || site.codigo}</span><span className={`site-state state-${site.status}`}>{site.status}</span>{site.resultado?.pdf_sha256 && <span className="recent-time">SHA-256: {site.resultado.pdf_sha256}</span>}{site.resultado?.erro && <span className="site-error">{site.resultado.erro}</span>}</div>)}
                   </article>
                 ))}
               </div>
@@ -263,12 +304,12 @@ export function Dashboard() {
         <aside className="sidebar" aria-label="Informações">
           <h2 className="side-label">Antes de emitir</h2>
           <div className="side-callout"><strong>Seleção de certidões</strong><p>Marque uma ou mais fontes e use “Consultar selecionadas”, ou use o botão da própria linha para consultar somente aquela certidão.</p></div>
-          <div className="side-callout"><strong>CAPTCHA humano</strong><p>Desafios de imagem aparecem aqui. reCAPTCHA e hCaptcha devem ser resolvidos na janela real do portal; tokens não são injetados.</p></div>
-          <div className="side-callout"><strong>Download automático</strong><p>Após a emissão, o PDF é baixado automaticamente quando o portal entrega um arquivo válido. Confirme a certidão diretamente na fonte emissora.</p></div>
+          <div className="side-callout"><strong>CAPTCHA humano</strong><p>Para CNPJ, CNDT, CGU e Comprovante CNPJ abrem em abas próprias com o documento preenchido. Resolva cada desafio no portal oficial e confirme cada aviso aqui; não injetamos nem automatizamos respostas de CAPTCHA.</p></div>
+          <div className="side-callout"><strong>Arquivos da consulta</strong><p>Os PDFs emitidos são salvos juntos na pasta Downloads da consulta. Use “Abrir pasta” no histórico; falhas não são apresentadas como certidões emitidas.</p></div>
         </aside>
       </main>
       <footer className="footer">SIG-Certidões · execução local · o identificador completo permanece somente em memória durante a consulta.</footer>
-      {captcha && <div className="modal-backdrop"><form className="captcha-modal" role="dialog" aria-modal="true" aria-labelledby="captcha-title" onSubmit={event => void resolveCaptcha(event)}><h2 id="captcha-title">Captcha necessário · {captcha.site_codigo}</h2>{captcha.tipo === 'imagem' ? <><img className="captcha-image" src={`data:image/png;base64,${captcha.imagem_base64}`} alt="Captcha do portal" /><label className="field"><span>Resposta do captcha</span><input autoFocus value={captchaAnswer} onChange={event => setCaptchaAnswer(event.target.value)} required /></label></> : <p>Resolva o desafio na janela aberta do portal e confirme aqui. Não copie nem automatize o token.</p>}<div className="modal-actions"><button className="primary" type="submit" disabled={captcha.tipo === 'imagem' && !captchaAnswer.trim()}>Já resolvi</button></div></form></div>}
+      {captcha && <div className="modal-backdrop"><form className="captcha-modal" role="dialog" aria-modal="true" aria-labelledby="captcha-title" onSubmit={event => void resolveCaptcha(event)}><h2 id="captcha-title">{captcha.tipo === 'token' ? 'Autenticação necessária' : 'CAPTCHA necessário'} · {captcha.site_codigo}{captchaPrompts.length > 1 ? ` · ${captchaPrompts.length} pendentes` : ''}</h2><p>{captcha.mensagem || (captcha.tipo === 'token' ? 'Autentique com seu certificado digital/token na aba do SICAF e navegue até a certidão oficial que deseja imprimir. Confirme aqui quando a página da certidão estiver pronta.' : 'Resolva o desafio diretamente na aba oficial do portal aberta no navegador. Depois volte aqui e confirme. Não copie, envie ou automatize respostas/tokens do CAPTCHA.')}</p><div className="modal-actions"><button className="primary" type="submit">{captcha.tipo === 'token' ? 'Certidão pronta' : captcha.site_codigo === 'cndt' ? 'Já emiti no portal' : 'Já resolvi'}</button></div></form></div>}
     </>
   );
 }

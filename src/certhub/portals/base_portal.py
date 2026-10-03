@@ -47,6 +47,14 @@ class BasePortal(ABC):
             captcha_method=captcha_method,
         )
 
+    def unimplemented_result(self) -> EmissionResult:
+        """Fail closed for legacy portal wrappers that do not fetch a real authority PDF."""
+        return self._result(
+            False,
+            "Fluxo oficial deste portal ainda não está implementado; nenhum PDF foi emitido.",
+            attempts=0,
+        )
+
     def open_browser(self):
         if self.browser_session is None:
             self.browser_session = BrowserSession(headless=self.request.headless)

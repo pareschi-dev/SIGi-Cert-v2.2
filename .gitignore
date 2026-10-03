@@ -6,7 +6,7 @@ __pycache__/
 output/
 logs/
 *.log
-frontend/node_modules/
+**/node_modules/
 frontend/dist/
 frontend/tsconfig.tsbuildinfo
 data/consultas_demo.sqlite3

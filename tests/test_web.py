@@ -1,16 +1,79 @@
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import certhub.web as web_module
-from certhub.web import CAPTCHA_LOCK, PENDING_CAPTCHAS, SITE_EXECUTOR, _connect, app
+from certhub.config import load_certidoes_config
+from certhub.web import (
+    CAPTCHA_LOCK,
+    MAX_CONCURRENT_SITE_TASKS,
+    PENDING_CAPTCHAS,
+    SITE_EXECUTION_MODES,
+    SITE_EXECUTOR,
+    _connect,
+    app,
+)
 
 
 @pytest.fixture(autouse=True)
 def prevent_external_portal_access(monkeypatch):
     monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda *args, **kwargs: None)
+
+
+def test_site_executor_limits_concurrency_to_three_portals():
+    assert MAX_CONCURRENT_SITE_TASKS == 3
+
+
+def test_cnpj_captcha_portals_are_submitted_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    submitted_sites = []
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: submitted_sites.append(args[1]))
+    client = TestClient(app)
+
+    response = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["receita_inss_cnpj", "tcu_inidoneos", "cartao_cnpj", "cndt", "ceis_cgu"],
+    })
+
+    assert response.status_code == 202
+    assert submitted_sites == [
+        "cndt", "ceis_cgu", "cartao_cnpj", "receita_inss_cnpj", "tcu_inidoneos",
+    ]
+
+
+def test_three_cnpj_captcha_pdfs_share_the_consultation_folder(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    captured_roots = {}
+
+    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root, additional_data=None, **kwargs):
+        captured_roots[site_code] = Path(target_root)
+        pdf_path = Path(target_root) / f"{web_module.SITE_FLOWS[site_code]['file_id']}.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%fixture\n")
+        return {"site_codigo": site_code, "pdf_path": str(pdf_path.resolve()), "pdf_sha256": "d" * 64}
+
+    monkeypatch.setattr(web_module, "run_site", fake_run_site)
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: function(*args))
+    client = TestClient(app)
+
+    response = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["cndt", "ceis_cgu", "cartao_cnpj"],
+    })
+
+    assert response.status_code == 202
+    assert set(captured_roots) == {"cndt", "ceis_cgu", "cartao_cnpj"}
+    assert len(set(captured_roots.values())) == 1
+    target_root = Path(response.json()["pasta_destino"])
+    assert set(path.name for path in target_root.glob("*.pdf")) == {
+        "cndt.pdf", "cgu_certidoes.pdf", "receita_cnpj_comprovante.pdf",
+    }
 
 
 def test_create_consultation_stores_only_document_hash(monkeypatch, tmp_path):
@@ -76,7 +139,7 @@ def test_rejects_invalid_document_and_unknown_site(monkeypatch, tmp_path):
     assert unknown_site.status_code == 422
 
 
-def test_rejects_site_without_implemented_macro(monkeypatch, tmp_path):
+def test_sicaf_request_is_accepted_for_token_assisted_flow(monkeypatch, tmp_path):
     monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
     client = TestClient(app)
 
@@ -89,8 +152,56 @@ def test_rejects_site_without_implemented_macro(monkeypatch, tmp_path):
         },
     )
 
-    assert response.status_code == 422
-    assert "Macros ainda não implementados" in response.json()["detail"][0]["msg"]
+    assert response.status_code == 202
+    assert response.json()["consulta"]["sites"][0]["status"] == "pendente"
+
+
+def test_receita_cpf_requires_birth_date_before_starting(monkeypatch, tmp_path):
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    client = TestClient(app)
+    base = {"documento": "529.982.247-25", "tipo": "CPF", "sites": ["receita_inss_cpf"]}
+
+    missing_date = client.post("/api/v1/consultas", json=base)
+    with_date = client.post("/api/v1/consultas", json={**base, "data_nascimento": "2000-01-01"})
+
+    assert missing_date.status_code == 422
+    assert with_date.status_code == 202
+
+
+def test_receita_cpf_birth_date_is_passed_transiently_not_persisted(monkeypatch, tmp_path):
+    database = tmp_path / "consultas.sqlite3"
+    downloads = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(database))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", downloads)
+    captured = {}
+
+    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root, additional_data=None, **kwargs):
+        captured.update(site=site_code, document=document, additional_data=additional_data)
+        target = target_root / "receita_cpf.pdf"
+        target.write_bytes(b"%PDF-1.4\n%cpf fixture\n")
+        return {"site_codigo": site_code, "pdf_path": str(target), "pdf_sha256": "c" * 64, "arquivo": target.name}
+
+    monkeypatch.setattr(web_module, "run_site", fake_run_site)
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: function(*args))
+    client = TestClient(app)
+    response = client.post("/api/v1/consultas", json={
+        "documento": "529.982.247-25",
+        "tipo": "CPF",
+        "data_nascimento": "2000-01-02",
+        "sites": ["receita_inss_cpf"],
+    })
+
+    assert response.status_code == 202
+    assert captured == {
+        "site": "receita_inss_cpf",
+        "document": "52998224725",
+        "additional_data": {"data_nascimento": "2000-01-02", "tipo": "CPF"},
+    }
+    with sqlite3.connect(database) as connection:
+        stored_text = " ".join(str(value) for row in connection.execute("SELECT * FROM consultas") for value in row)
+        stored_text += " ".join(row[0] for row in connection.execute("SELECT payload FROM consulta_eventos"))
+    assert "2000-01-02" not in stored_text
+    assert "52998224725" not in stored_text
 
 
 def test_accepts_formatted_cnpj_with_surrounding_spaces(monkeypatch, tmp_path):
@@ -120,7 +231,7 @@ def test_catalog_and_api_status(monkeypatch, tmp_path):
     assert catalog.status_code == 200
     assert len(catalog.json()["sites"]) == 10
     assert {site["codigo"]: site["nome"] for site in catalog.json()["sites"]} == {
-        "sicaf": "Compras.gov.br · Acesse sua Conta",
+        "sicaf": "SICAF — Compras.gov.br",
         "receita_inss_cnpj": "Certidão de Pessoa Jurídica (CNPJ)",
         "receita_inss_cpf": "Certidão de Pessoa Física (CPF)",
         "fgts": "Certificado de Regularidade do FGTS (CRF)",
@@ -132,9 +243,12 @@ def test_catalog_and_api_status(monkeypatch, tmp_path):
         "simples_nacional": "Consulta Optantes pelo Simples Nacional",
     }
     configured = {site["codigo"] for site in catalog.json()["sites"] if site["integration_configured"]}
-    assert configured == {"inelegibilidade_cnj", "receita_inss_cnpj", "fgts"}
+    assert configured == {site["codigo"] for site in catalog.json()["sites"]}
+    catalog_by_code = {site["codigo"]: site for site in catalog.json()["sites"]}
+    assert {code: site["execution_mode"] for code, site in catalog_by_code.items()} == SITE_EXECUTION_MODES
+    assert all(portal["tipo"] == "automacao" for portal in load_certidoes_config()["portais"])
     cnj = next(site for site in catalog.json()["sites"] if site["codigo"] == "inelegibilidade_cnj")
-    assert cnj["url"].endswith("consultar_requerido.php")
+    assert cnj["url"].endswith("consultar_requerido.php?validar=form")
     assert history.json() == {"consultas": []}
 
 
@@ -197,9 +311,9 @@ def test_consultation_worker_persists_real_pdf_result(monkeypatch, tmp_path):
     output_root = tmp_path / "output"
     monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
 
-    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root):
+    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root, additional_data=None, **kwargs):
         on_status(site_code, "rodando", None)
-        pdf_path = target_root / consultation_id / f"{site_code}.pdf"
+        pdf_path = target_root / "cnj_improbidade.pdf"
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(b"%PDF-1.4\n%test certificate\n")
         return {"site_codigo": site_code, "pdf_path": str(pdf_path.resolve()), "pdf_sha256": "a" * 64}
@@ -221,9 +335,76 @@ def test_consultation_worker_persists_real_pdf_result(monkeypatch, tmp_path):
     downloaded_pdf = client.get(f"/api/v1/consultas/{consultation_id}/sites/inelegibilidade_cnj/pdf")
 
     assert created.status_code == 202
-    assert result["status"] == "concluida"
+    assert result["status"] == "concluida", result["sites"]
     assert result["sites"][0]["status"] == "sucesso"
     assert result["resultados_consolidados"][0]["pdf_sha256"] == "a" * 64
+    assert result["pasta_disponivel"] is True
+    assert Path(created.json()["pasta_destino"]).name.startswith("12345678000195_")
+    assert Path(result["pasta_destino"]).name.startswith("12345678000195_")
+    assert Path(result["resultados_consolidados"][0]["pdf_path"]).parent == Path(result["pasta_destino"])
+    with sqlite3.connect(tmp_path / "consultas.sqlite3") as connection:
+        stored_result = connection.execute("SELECT resultado FROM consulta_sites").fetchone()[0]
+        stored_events = " ".join(row[0] for row in connection.execute("SELECT payload FROM consulta_eventos"))
+    assert "pdf_path" not in stored_result
+    assert "12345678000195" not in stored_events
     assert downloaded_pdf.status_code == 200
     assert "attachment" in downloaded_pdf.headers["content-disposition"].lower()
     assert downloaded_pdf.content.startswith(b"%PDF-")
+
+
+def test_open_folder_endpoint_opens_only_the_consultation_folder(monkeypatch, tmp_path):
+    database = tmp_path / "consultas.sqlite3"
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(database))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    opened = []
+    monkeypatch.setattr(web_module, "_open_directory", opened.append)
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda *args, **kwargs: None)
+    client = TestClient(app)
+
+    response = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["inelegibilidade_cnj"],
+    })
+    consultation_id = response.json()["consulta_id"]
+    opened_response = client.post(f"/api/v1/consultas/{consultation_id}/abrir-pasta")
+
+    assert opened_response.status_code == 200
+    assert opened == [Path(response.json()["pasta_destino"])]
+
+
+def test_all_portals_in_one_consultation_share_the_same_flat_download_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", tmp_path / "downloads")
+
+    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root, additional_data=None, **kwargs):
+        filenames = {
+            "inelegibilidade_cnj": "cnj_improbidade.pdf",
+            "receita_inss_cnpj": "receita_cnpj.pdf",
+        }
+        target = target_root / filenames[site_code]
+        target.write_bytes(b"%PDF-1.4\n%official-flow fixture\n")
+        return {
+            "site_codigo": site_code,
+            "pdf_path": str(target),
+            "pdf_sha256": "b" * 64,
+            "arquivo": target.name,
+        }
+
+    monkeypatch.setattr(web_module, "run_site", fake_run_site)
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: function(*args))
+    client = TestClient(app)
+
+    created = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["inelegibilidade_cnj", "receita_inss_cnpj"],
+    })
+    consultation = client.get(f"/api/v1/consultas/{created.json()['consulta_id']}").json()["consulta"]
+    destination = Path(consultation["pasta_destino"])
+
+    assert created.status_code == 202
+    assert consultation["status"] == "concluida"
+    assert {file.name for file in destination.iterdir()} == {"cnj_improbidade.pdf", "receita_cnpj.pdf"}
+    assert all(Path(result["pdf_path"]).parent == destination for result in consultation["resultados_consolidados"])

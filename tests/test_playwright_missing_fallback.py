@@ -3,7 +3,9 @@ import pytest
 import certhub.site_automation as site_automation
 
 
-def test_run_site_reports_missing_playwright_without_crashing_import():
+def test_run_site_reports_missing_playwright_without_crashing_import(monkeypatch):
+    monkeypatch.setattr(site_automation, "sync_playwright", None)
+
     with pytest.raises(site_automation.SiteAutomationError, match="Playwright|navegador"):
         site_automation.run_site(
             consultation_id="consulta-1",

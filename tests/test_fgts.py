@@ -48,17 +48,24 @@ def prevent_external_portal_access(monkeypatch):
     monkeypatch.setattr("certhub.portals.base_portal.BrowserSession", FakeBrowserSession)
 
 
-def test_fgts_portal_emits_valid_cnpj():
+def test_legacy_fgts_wrapper_never_claims_a_synthetic_certificate():
     result = FGTSPortal(EmissionRequest(portal="fgts", document=VALID_CNPJ)).emit()
-    assert result.success is True
-    assert result.captcha_type == "none"
-    assert result.pdf_path is not None
+    assert result.success is False
+    assert result.pdf_path is None
+    assert "não está implementado" in result.message
 
 
-def test_cli_rejects_portal_without_macro():
+def test_cli_routes_sicaf_to_token_assisted_flow(monkeypatch, tmp_path):
+    called = {}
+
+    def fake_run_site(consultation_id, site_code, *args, **kwargs):
+        called["site_code"] = site_code
+        return {"arquivo": "compras_gov.pdf", "pdf_path": str(tmp_path / "compras_gov.pdf"), "pdf_sha256": "a" * 64}
+
+    monkeypatch.setattr("certhub.main.run_site", fake_run_site)
     response = runner.invoke(app, ["emitir", "--portal", "sicaf", "--documento", VALID_CNPJ])
-    assert response.exit_code != 0
-    assert "Macro do portal 'sicaf' ainda não implementado" in response.output
+    assert response.exit_code == 0
+    assert called["site_code"] == "sicaf"
 
 
 @pytest.mark.parametrize(

@@ -13,30 +13,4 @@ browser:
     height: 1080
 
 captcha:
-  ocr:
-    engine: "ddddocr"
-    confidence_threshold: 0.7
-  services:
-    twocaptcha:
-      api_key: "${TWOCAPTCHA_API_KEY}"
-      timeout: 120
-      polling_interval: 5
-
-proxy:
-  enabled: false
-  list: []
-  rotation: "random"
-
-retry:
-  max_attempts: 3
-  delay_seconds: 5
-
-storage:
-  output_dir: "./output/certhub"
-  log_dir: "./logs"
-  database: "./data/certhub.db"
-
-rate_limit:
-  delay_entre_emissoes_segundos: 10
-  delay_entre_portais_segundos: 30
-  max_emissoes_por_hora: 50
+  require_human: true
