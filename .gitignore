@@ -11,3 +11,5 @@ frontend/dist/
 frontend/tsconfig.tsbuildinfo
 data/consultas_demo.sqlite3
 *.egg-info/
+data/
+frontend/.tsupgrader/

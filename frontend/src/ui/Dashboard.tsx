@@ -6,15 +6,17 @@ type Site = {
   orgao: string;
   captcha: string;
   url: string;
-  execution_mode: 'INTERNO' | 'VISÍVEL' | 'VISÍVEL/CAPTCHA' | 'TOKEN';
+  execution_mode: 'INTERNO' | 'VISÍVEL' | 'VISÍVEL/CAPTCHA' | 'TOKEN' | 'MANUAL';
   document_types: ('CPF' | 'CNPJ')[];
   integration_configured: boolean;
+  manual_only: boolean;
+  manual_mode: 'captcha' | 'token' | null;
 };
 
 type ConsultationSite = {
   codigo: string;
   status: string;
-  resultado: { erro?: string; arquivo?: string; pdf_sha256?: string; pdf_path?: string } | null;
+  resultado: { erro?: string; detalhe?: string; arquivo?: string; pdf_sha256?: string; pdf_path?: string } | null;
 };
 
 type Consultation = {
@@ -25,6 +27,7 @@ type Consultation = {
   status: string;
   pasta_disponivel: boolean;
   pasta_destino: string | null;
+  arquivos_pdf: { nome: string; tamanho: number; valido: boolean; sha256: string; modificado_em: string }[];
   sites: ConsultationSite[];
 };
 
@@ -36,11 +39,28 @@ type CaptchaPrompt = {
   mensagem?: string;
 };
 
+const manualPdfNames: Record<string, string> = {
+  cndt: 'cndt.pdf',
+  ceis_cgu: 'cgu_certidoes.pdf',
+  cartao_cnpj: 'receita_cnpj_comprovante.pdf',
+  sicaf: 'compras_gov.pdf',
+  simples_nacional: 'simples_nacional.pdf',
+};
+
 export function addRecentCnpj(history: string[], cnpj: string): string[] {
   const normalized = cnpj.trim();
   const digits = normalized.replace(/\D/g, '');
   if (!digits) return history;
   return [normalized, ...history.filter(item => item.replace(/\D/g, '') !== digits)].slice(0, 5);
+}
+
+export function movePdfInOrder(files: string[], filename: string, targetIndex: number): string[] {
+  const sourceIndex = files.indexOf(filename);
+  if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= files.length || sourceIndex === targetIndex) return files;
+  const reordered = [...files];
+  reordered.splice(sourceIndex, 1);
+  reordered.splice(targetIndex, 0, filename);
+  return reordered;
 }
 
 export function Dashboard() {
@@ -55,11 +75,29 @@ export function Dashboard() {
   const [notice, setNotice] = useState('');
   const [busySite, setBusySite] = useState('');
   const [activeConsultationIds, setActiveConsultationIds] = useState<string[]>([]);
+  const [activeConsultationId, setActiveConsultationId] = useState('');
+  const [activeSessionDocumentKey, setActiveSessionDocumentKey] = useState('');
+  const [mergeOrder, setMergeOrder] = useState<string[]>([]);
+  const [draggedPdf, setDraggedPdf] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
   const [captchaPrompts, setCaptchaPrompts] = useState<CaptchaPrompt[]>([]);
   const captcha = captchaPrompts[0] ?? null;
+  const currentSession = consultations.find(consultation => consultation.id === activeConsultationId)
+    ?? consultations[0]
+    ?? null;
   const eligibleSites = sites.filter(site => site.document_types.includes(documentType));
   const selectableSites = eligibleSites.filter(site => site.integration_configured);
-  const automatedSiteCount = sites.filter(site => site.integration_configured).length;
+  const manualCaptchaSites = eligibleSites.filter(site => site.manual_mode === 'captcha');
+  const manualTokenSites = eligibleSites.filter(site => site.manual_mode === 'token');
+  const automatedSites = eligibleSites.filter(site => !site.manual_only);
+
+  const availableMergeFiles = (currentSession?.arquivos_pdf ?? [])
+    .filter(file => file.valido && file.nome.toLowerCase() !== 'certidoes_unificadas.pdf')
+    .map(file => file.nome);
+  const orderedMergeFiles = [
+    ...mergeOrder.filter(filename => availableMergeFiles.includes(filename)),
+    ...availableMergeFiles.filter(filename => !mergeOrder.includes(filename)),
+  ];
 
   useEffect(() => {
     setSelectedSites(current => current.filter(siteCode => {
@@ -87,6 +125,18 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
+    const poll = window.setInterval(() => loadData().catch(() => undefined), 2000);
+    return () => window.clearInterval(poll);
+  }, []);
+
+  useEffect(() => {
+    setMergeOrder(current => [
+      ...current.filter(filename => availableMergeFiles.includes(filename)),
+      ...availableMergeFiles.filter(filename => !current.includes(filename)),
+    ]);
+  }, [currentSession?.id, availableMergeFiles.join('|')]);
+
+  useEffect(() => {
     if (!activeConsultationIds.length) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const sockets = activeConsultationIds.map(consultationId => {
@@ -106,10 +156,8 @@ export function Dashboard() {
       };
       return socket;
     });
-    const poll = window.setInterval(() => loadData().catch(() => undefined), 2000);
     return () => {
       sockets.forEach(socket => socket.close());
-      window.clearInterval(poll);
     };
   }, [activeConsultationIds]);
 
@@ -125,10 +173,18 @@ export function Dashboard() {
     setBusySite(siteCodes.length === 1 ? siteCodes[0] : 'selected');
     setNotice('');
     try {
+      const documentKey = `${documentType}:${document.replace(/\D/g, '')}`;
+      const reuseActiveSession = activeConsultationId && activeSessionDocumentKey === documentKey;
       const response = await fetch('/api/v1/consultas', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documento: document, tipo: documentType, sites: siteCodes, ...(documentType === 'CPF' && siteCodes.includes('receita_inss_cpf') ? { data_nascimento: birthDate } : {}) }),
+        body: JSON.stringify({
+          documento: document,
+          tipo: documentType,
+          sites: siteCodes,
+          ...(documentType === 'CPF' && siteCodes.includes('receita_inss_cpf') ? { data_nascimento: birthDate } : {}),
+          ...(reuseActiveSession ? { consulta_id: activeConsultationId } : {}),
+        }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -137,12 +193,75 @@ export function Dashboard() {
       }
       if (documentType === 'CNPJ') setRecentCnpjs(current => addRecentCnpj(current, document));
       setActiveConsultationIds(current => [...new Set([...current, payload.consulta_id])]);
+      setActiveConsultationId(payload.consulta_id);
+      setActiveSessionDocumentKey(documentKey);
       setNotice(`Consulta iniciada para ${siteCodes.length} certidão(ões). Os portais internos rodam em modo invisível; desafios assistidos aparecem aqui.`);
       await loadData();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Erro ao iniciar consulta.');
     } finally {
       setBusySite('');
+    }
+  }
+
+  async function openManualPortal(site: Site) {
+    if (!document.trim()) {
+      setNotice('Informe o CPF/CNPJ antes de abrir o portal.');
+      return;
+    }
+    const portalTab = window.open('about:blank', '_blank');
+    if (!portalTab) {
+      setNotice('O navegador bloqueou a nova aba. Permita pop-ups para este painel e tente novamente.');
+      return;
+    }
+    setBusySite(site.codigo);
+    setNotice('Preparando a pasta da consulta e abrindo o portal oficial…');
+    try {
+      const documentKey = `${documentType}:${document.replace(/\D/g, '')}`;
+      const reuseActiveSession = activeConsultationId && activeSessionDocumentKey === documentKey;
+      const response = await fetch('/api/v1/consultas/manual', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          documento: document,
+          tipo: documentType,
+          site: site.codigo,
+          ...(reuseActiveSession ? { consulta_id: activeConsultationId } : {}),
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Não foi possível abrir a sessão manual.');
+      if (documentType === 'CNPJ') setRecentCnpjs(current => addRecentCnpj(current, document));
+      portalTab.location.href = payload.url;
+      setActiveConsultationId(payload.consulta_id);
+      setActiveSessionDocumentKey(documentKey);
+      await loadData();
+      setNotice(`Portal aberto. Salve ${payload.nome_pdf} na pasta da sessão exibida no card.`);
+    } catch (error) {
+      portalTab.close();
+      setNotice(error instanceof Error ? error.message : 'Erro ao abrir o portal oficial.');
+    } finally {
+      setBusySite('');
+    }
+  }
+
+  async function continueSimpleManually(consultationId: string, site: Site) {
+    const portalTab = window.open('about:blank', '_blank');
+    if (!portalTab) {
+      setNotice('O navegador bloqueou a nova aba. Permita pop-ups para este painel e tente novamente.');
+      return;
+    }
+    try {
+      const response = await fetch(`/api/v1/consultas/${consultationId}/sites/simples_nacional/manual`, { method: 'POST' });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Não foi possível abrir a contingência manual.');
+      portalTab.location.href = payload.url || site.url;
+      setActiveConsultationId(consultationId);
+      await loadData();
+      setNotice(`Portal aberto na mesma sessão. Salve ${payload.nome_pdf} na pasta da sessão exibida no card.`);
+    } catch (error) {
+      portalTab.close();
+      setNotice(error instanceof Error ? error.message : 'Erro ao abrir o portal Simples Nacional.');
     }
   }
 
@@ -172,6 +291,15 @@ export function Dashboard() {
     }
   }
 
+  async function copySessionFolder(path: string) {
+    try {
+      await navigator.clipboard.writeText(path);
+      setNotice('Caminho da pasta copiado. Selecione-o na janela “Salvar como” do portal oficial.');
+    } catch {
+      setNotice(`Pasta da sessão: ${path}`);
+    }
+  }
+
   async function resolveCaptcha(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!captcha) return;
@@ -192,12 +320,48 @@ export function Dashboard() {
     }
   }
 
+  async function mergeSessionPdfs() {
+    if (!currentSession || orderedMergeFiles.length < 2 || merging) return;
+    setMerging(true);
+    try {
+      const response = await fetch(`/api/v1/consultas/${currentSession.id}/pdf/unir`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ arquivos: orderedMergeFiles }),
+      });
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload.detail || 'Não foi possível unir os PDFs.');
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = window.document.createElement('a');
+      link.href = url;
+      link.download = 'certidoes_unificadas.pdf';
+      window.document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice('PDFs unidos na ordem exibida. O documento também foi salvo na pasta da sessão.');
+      await loadData();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Erro ao unir PDFs.');
+    } finally {
+      setMerging(false);
+    }
+  }
+
+  function dropPdfOn(filename: string) {
+    if (!draggedPdf || draggedPdf === filename) return;
+    setMergeOrder(movePdfInOrder(orderedMergeFiles, draggedPdf, orderedMergeFiles.indexOf(filename)));
+    setDraggedPdf(null);
+  }
+
   return (
     <>
       <header className="topbar">
-        <a className="brand" href="/" aria-label="SIG-Certidões início">
-          <span className="brand-wordmark" aria-hidden="true">SIG-Certidões<span className="brand-accent" /></span>
-          <span className="brand-copy"><small>Sistema Inteligente de Gestão</small></span>
+        <a className="brand" href="/" aria-label="SIGi início">
+          <span className="brand-wordmark" aria-hidden="true">SIG<span className="brand-i">i</span></span>
+          <span className="brand-copy"><small>Sistema Inteligente de Gestão Integrada</small></span>
         </a>
         <div className="top-actions">
           <span className="environment"><i className="dot" /> Automação local · Playwright</span>
@@ -211,11 +375,6 @@ export function Dashboard() {
             <div><h1>Central de certidões</h1><p>Selecione uma certidão para abrir o portal e emitir o documento.</p></div>
             <time className="date">{new Intl.DateTimeFormat('pt-BR', { dateStyle: 'full' }).format(new Date())}</time>
           </div>
-          <section className="metrics" aria-label="Resumo">
-            <div className="metric"><div className="metric-label">Sites no catálogo</div><div className="metric-value">{sites.length || 10}</div><div className="metric-note">Links oficiais</div></div>
-            <div className="metric"><div className="metric-label">Fluxos automatizados</div><div className="metric-value green">{automatedSiteCount}</div><div className="metric-note">Com automação integrada</div></div>
-            <div className="metric"><div className="metric-label">Solicitações recentes</div><div className="metric-value">{consultations.length}</div><div className="metric-note">Neste ambiente local</div></div>
-          </section>
           <div className="workspace">
             <section className="panel" aria-labelledby="form-title">
               <div className="panel-head"><h2 id="form-title">Documento</h2><span>CPF/CNPJ não é persistido em claro</span></div>
@@ -267,7 +426,7 @@ export function Dashboard() {
             <section className="panel" aria-labelledby="sites-title">
               <div className="panel-head"><h2 id="sites-title">Certidões disponíveis</h2><button className="text-button" type="button" disabled={!selectableSites.length} onClick={toggleAllEligible}>{selectedSites.length === selectableSites.length ? 'Desmarcar disponíveis' : 'Selecionar disponíveis'}</button></div>
               <div className="portal-list">
-                {eligibleSites.map(site => {
+                {automatedSites.map(site => {
                   const compatible = site.document_types.includes(documentType);
                   const canRun = site.integration_configured && compatible && !busySite;
                   return (
@@ -287,6 +446,42 @@ export function Dashboard() {
               </div>
               <div className="selected-actions"><span>{selectedSites.length} certidão(ões) selecionada(s)</span><button className="primary" type="button" disabled={!selectedSites.length || Boolean(busySite)} onClick={() => void consultSelectedSites()}>Consultar selecionadas</button></div>
             </section>
+            {manualTokenSites.map(site => <section className="panel manual-token-panel" aria-labelledby="manual-token-title" key={site.codigo}>
+              <div className="panel-head manual-token-head">
+                <div><h2 id="manual-token-title">SICAF — certificado digital/token</h2><p>Consulta 100% manual. O SIGi não automatiza certificado digital, token ou etapas autenticadas.</p></div>
+                <span className="manual-badge token-badge">Acesso manual</span>
+              </div>
+              <div className="portal-row">
+                <span className="manual-site-icon token-site-icon" aria-hidden="true">🔐</span>
+                <div className="portal-details">
+                  <strong>{site.nome}</strong>
+                  <span className="site-org">{site.orgao}</span>
+                  <span className="portal-meta">Autentique no portal e salve o PDF na pasta da sessão como {manualPdfNames[site.codigo]}.</span>
+                </div>
+                <div className="portal-actions">
+                  <button className="primary small-button" type="button" disabled={Boolean(busySite)} onClick={() => void openManualPortal(site)}>Abrir SICAF</button>
+                </div>
+              </div>
+            </section>)}
+            {manualCaptchaSites.length > 0 && <section className="panel manual-captcha-panel" aria-labelledby="manual-captcha-title">
+              <div className="panel-head manual-captcha-head">
+                <div><h2 id="manual-captcha-title">Portais com CAPTCHA — emissão manual</h2><p>O SIGi não automatiza esses portais. Abra o site, conclua a emissão e salve o PDF na pasta da sessão.</p></div>
+                <span className="manual-badge">100% manual</span>
+              </div>
+              <div className="portal-list">
+                {manualCaptchaSites.map(site => <article className="portal-row" key={site.codigo}>
+                  <span className="manual-site-icon" aria-hidden="true">↗</span>
+                  <div className="portal-details">
+                    <strong>{site.nome}</strong>
+                    <span className="site-org">{site.orgao}</span>
+                    <span className="portal-meta">Portal oficial · {site.captcha}</span>
+                  </div>
+                  <div className="portal-actions">
+                    <button className="primary small-button" type="button" disabled={Boolean(busySite)} onClick={() => void openManualPortal(site)}>Abrir site</button>
+                  </div>
+                </article>)}
+              </div>
+            </section>}
             <section className="panel" aria-labelledby="recent-title">
               <div className="panel-head"><h2 id="recent-title">Histórico de consultas</h2><span>Últimas 25</span></div>
               <div className="recent-list">
@@ -294,7 +489,18 @@ export function Dashboard() {
                 {consultations.map(consultation => (
                   <article className="recent-item" key={consultation.id}>
                     <div className="recent-top"><div><div className="recent-doc">{consultation.documento_tipo} · {consultation.documento_mascarado}</div><div className="recent-time">{new Date(consultation.iniciado_em).toLocaleString('pt-BR')} · {consultation.status}</div></div>{consultation.pasta_disponivel && <button className="text-button" type="button" onClick={() => void openConsultationFolder(consultation.id)}>Abrir pasta</button>}</div>
-                    {consultation.sites.map(site => <div className="recent-site" key={site.codigo}><span>{sites.find(item => item.codigo === site.codigo)?.nome || site.codigo}</span><span className={`site-state state-${site.status}`}>{site.status}</span>{site.resultado?.pdf_sha256 && <span className="recent-time">SHA-256: {site.resultado.pdf_sha256}</span>}{site.resultado?.erro && <span className="site-error">{site.resultado.erro}</span>}</div>)}
+                    {consultation.sites.map(site => {
+                      const manualSimpleFallback = site.codigo === 'simples_nacional' && site.status === 'erro';
+                      const simplePortal = manualSimpleFallback ? sites.find(item => item.codigo === site.codigo) : undefined;
+                      return <div className="recent-site" key={site.codigo}>
+                        <span>{sites.find(item => item.codigo === site.codigo)?.nome || site.codigo}</span>
+                        <span className={`site-state state-${site.status}`}>{site.status}</span>
+                        {site.resultado?.detalhe && <span className="recent-time">{site.resultado.detalhe}</span>}
+                        {site.resultado?.pdf_sha256 && <span className="recent-time">SHA-256: {site.resultado.pdf_sha256}</span>}
+                        {site.resultado?.erro && <span className="site-error">{site.resultado.erro}</span>}
+                        {simplePortal && <button className="text-button" type="button" onClick={() => void continueSimpleManually(consultation.id, simplePortal)}>Continuar manualmente nesta sessão</button>}
+                      </div>;
+                    })}
                   </article>
                 ))}
               </div>
@@ -303,12 +509,63 @@ export function Dashboard() {
         </section>
         <aside className="sidebar" aria-label="Informações">
           <h2 className="side-label">Antes de emitir</h2>
-          <div className="side-callout"><strong>Seleção de certidões</strong><p>Marque uma ou mais fontes e use “Consultar selecionadas”, ou use o botão da própria linha para consultar somente aquela certidão.</p></div>
-          <div className="side-callout"><strong>CAPTCHA humano</strong><p>Para CNPJ, CNDT, CGU e Comprovante CNPJ abrem em abas próprias com o documento preenchido. Resolva cada desafio no portal oficial e confirme cada aviso aqui; não injetamos nem automatizamos respostas de CAPTCHA.</p></div>
-          <div className="side-callout"><strong>Arquivos da consulta</strong><p>Os PDFs emitidos são salvos juntos na pasta Downloads da consulta. Use “Abrir pasta” no histórico; falhas não são apresentadas como certidões emitidas.</p></div>
+          <div className="side-callout"><strong>Seleção de certidões</strong><p>Marque uma ou mais certidões e clique em “Consultar selecionadas”. Para executar apenas uma, use “Consultar” na linha correspondente.</p></div>
+          <div className="side-callout"><strong>Automático e manual</strong><p>As cinco certidões automatizadas rodam em segundo plano, sem exibir cliques ou janelas do navegador. CNDT, CGU e Comprovante CNPJ são manuais por CAPTCHA; o SICAF fica separado por exigir certificado/token. Abra cada portal e salve o PDF na pasta da sessão.</p></div>
+          <div className="side-callout"><strong>Arquivos da consulta</strong><p>Os PDFs válidos ficam juntos na pasta Downloads da consulta. Use “Abrir pasta” no histórico. Uma consulta só aparece como sucesso depois que o PDF é baixado e validado.</p></div>
+          <section className="side-callout session-files" aria-live="polite" aria-labelledby="session-files-title">
+            <strong id="session-files-title">Pasta da sessão</strong>
+            {!currentSession && <p>Inicie uma consulta para criar a pasta e acompanhar os PDFs.</p>}
+            {currentSession && <>
+              <p>Esta pasta da consulta ativa permanece selecionada enquanto você emite e baixa os documentos. Nos portais manuais, escolha-a na janela “Salvar como” e use o nome abaixo; não é criada outra pasta ao abrir mais um portal da mesma consulta.</p>
+              <ul className="session-file-list">{currentSession.sites.filter(site => manualPdfNames[site.codigo]).map(site => <li key={site.codigo}>
+                <span className="session-file-valid" aria-hidden="true">↓</span>
+                <span className="session-file-name">{site.codigo}: {manualPdfNames[site.codigo]}</span>
+              </li>)}</ul>
+              {currentSession.pasta_destino && <>
+                <code className="session-folder-path">{currentSession.pasta_destino}</code>
+                <div className="session-folder-actions">
+                  <button className="text-button" type="button" onClick={() => void copySessionFolder(currentSession.pasta_destino!)}>Copiar caminho</button>
+                  <button className="text-button" type="button" onClick={() => void openConsultationFolder(currentSession.id)}>Abrir pasta</button>
+                </div>
+              </>}
+              {currentSession.arquivos_pdf.length > 0
+                ? <ul className="session-file-list">{currentSession.arquivos_pdf.map(file => <li key={file.nome}>
+                  <span className={file.valido ? 'session-file-valid' : 'session-file-invalid'} aria-hidden="true">{file.valido ? '✓' : '!'}</span>
+                  <span className="session-file-name">{file.nome}</span>
+                  <small>{file.valido ? `${(file.tamanho / 1024).toFixed(1)} KB` : 'PDF inválido'}</small>
+                </li>)}</ul>
+                : <p className="session-files-empty">Aguardando PDFs nesta sessão…</p>}
+              <section className="pdf-merge" aria-labelledby="pdf-merge-title">
+                <strong id="pdf-merge-title">Unir PDFs da sessão</strong>
+                <p>Arraste os arquivos para definir a sequência do documento final:</p>
+                {orderedMergeFiles.length > 0
+                  ? <ol className="pdf-merge-list">{orderedMergeFiles.map((filename, index) => <li
+                    key={filename}
+                    draggable
+                    onDragStart={event => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', filename); setDraggedPdf(filename); }}
+                    onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}
+                    onDrop={event => { event.preventDefault(); dropPdfOn(filename); }}
+                    onDragEnd={() => setDraggedPdf(null)}
+                    className={draggedPdf === filename ? 'is-dragged' : ''}
+                  >
+                    <span className="pdf-merge-grip" aria-hidden="true">⠿</span>
+                    <span className="pdf-merge-number">{index + 1}.</span>
+                    <span className="pdf-merge-filename">{filename}</span>
+                    <span className="pdf-merge-move">
+                      <button type="button" aria-label={`Mover ${filename} para cima`} disabled={index === 0} onClick={() => setMergeOrder(movePdfInOrder(orderedMergeFiles, filename, index - 1))}>↑</button>
+                      <button type="button" aria-label={`Mover ${filename} para baixo`} disabled={index === orderedMergeFiles.length - 1} onClick={() => setMergeOrder(movePdfInOrder(orderedMergeFiles, filename, index + 1))}>↓</button>
+                    </span>
+                  </li>)}</ol>
+                  : <p className="session-files-empty">Salve pelo menos dois PDFs válidos para habilitar a união.</p>}
+                <button className="primary small-button pdf-merge-button" type="button" disabled={orderedMergeFiles.length < 2 || merging} onClick={() => void mergeSessionPdfs()}>
+                  {merging ? 'Unindo PDFs…' : 'Unir e baixar PDF único'}
+                </button>
+              </section>
+            </>}
+          </section>
         </aside>
       </main>
-      <footer className="footer">SIG-Certidões · execução local · o identificador completo permanece somente em memória durante a consulta.</footer>
+      <footer className="footer">SIGi · execução local · o identificador completo permanece somente em memória durante a consulta.</footer>
       {captcha && <div className="modal-backdrop"><form className="captcha-modal" role="dialog" aria-modal="true" aria-labelledby="captcha-title" onSubmit={event => void resolveCaptcha(event)}><h2 id="captcha-title">{captcha.tipo === 'token' ? 'Autenticação necessária' : 'CAPTCHA necessário'} · {captcha.site_codigo}{captchaPrompts.length > 1 ? ` · ${captchaPrompts.length} pendentes` : ''}</h2><p>{captcha.mensagem || (captcha.tipo === 'token' ? 'Autentique com seu certificado digital/token na aba do SICAF e navegue até a certidão oficial que deseja imprimir. Confirme aqui quando a página da certidão estiver pronta.' : 'Resolva o desafio diretamente na aba oficial do portal aberta no navegador. Depois volte aqui e confirme. Não copie, envie ou automatize respostas/tokens do CAPTCHA.')}</p><div className="modal-actions"><button className="primary" type="submit">{captcha.tipo === 'token' ? 'Certidão pronta' : captcha.site_codigo === 'cndt' ? 'Já emiti no portal' : 'Já resolvi'}</button></div></form></div>}
     </>
   );

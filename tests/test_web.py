@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfReader, PdfWriter
 
 import certhub.web as web_module
 from certhub.config import load_certidoes_config
@@ -27,7 +28,7 @@ def test_site_executor_limits_concurrency_to_three_portals():
     assert MAX_CONCURRENT_SITE_TASKS == 3
 
 
-def test_cnpj_captcha_portals_are_submitted_first(monkeypatch, tmp_path):
+def test_automated_portals_are_submitted_without_manual_portals(monkeypatch, tmp_path):
     monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
     submitted_sites = []
     monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: submitted_sites.append(args[1]))
@@ -36,44 +37,161 @@ def test_cnpj_captcha_portals_are_submitted_first(monkeypatch, tmp_path):
     response = client.post("/api/v1/consultas", json={
         "documento": "12.345.678/0001-95",
         "tipo": "CNPJ",
-        "sites": ["receita_inss_cnpj", "tcu_inidoneos", "cartao_cnpj", "cndt", "ceis_cgu"],
+        "sites": ["receita_inss_cnpj", "tcu_inidoneos"],
     })
 
     assert response.status_code == 202
     assert submitted_sites == [
-        "cndt", "ceis_cgu", "cartao_cnpj", "receita_inss_cnpj", "tcu_inidoneos",
+        "receita_inss_cnpj", "tcu_inidoneos",
     ]
 
 
-def test_three_cnpj_captcha_pdfs_share_the_consultation_folder(monkeypatch, tmp_path):
+def test_sequential_automated_portal_consultations_share_one_folder(monkeypatch, tmp_path):
     output_root = tmp_path / "downloads"
     monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
     monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
-    captured_roots = {}
-
-    def fake_run_site(consultation_id, site_code, document, on_status, on_captcha, target_root, additional_data=None, **kwargs):
-        captured_roots[site_code] = Path(target_root)
-        pdf_path = Path(target_root) / f"{web_module.SITE_FLOWS[site_code]['file_id']}.pdf"
-        pdf_path.write_bytes(b"%PDF-1.4\n%fixture\n")
-        return {"site_codigo": site_code, "pdf_path": str(pdf_path.resolve()), "pdf_sha256": "d" * 64}
-
-    monkeypatch.setattr(web_module, "run_site", fake_run_site)
-    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: function(*args))
+    submitted_sites = []
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: submitted_sites.append(args[1]))
     client = TestClient(app)
 
-    response = client.post("/api/v1/consultas", json={
+    first = client.post("/api/v1/consultas", json={
         "documento": "12.345.678/0001-95",
         "tipo": "CNPJ",
-        "sites": ["cndt", "ceis_cgu", "cartao_cnpj"],
+        "sites": ["inelegibilidade_cnj"],
+    })
+    assert first.status_code == 202
+    initial = first.json()
+
+    second = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["tcu_inidoneos"],
+        "consulta_id": initial["consulta_id"],
     })
 
-    assert response.status_code == 202
-    assert set(captured_roots) == {"cndt", "ceis_cgu", "cartao_cnpj"}
-    assert len(set(captured_roots.values())) == 1
-    target_root = Path(response.json()["pasta_destino"])
-    assert set(path.name for path in target_root.glob("*.pdf")) == {
-        "cndt.pdf", "cgu_certidoes.pdf", "receita_cnpj_comprovante.pdf",
+    assert second.status_code == 202
+    appended = second.json()
+    assert appended["consulta_id"] == initial["consulta_id"]
+    assert appended["pasta_destino"] == initial["pasta_destino"]
+    assert len(list(output_root.iterdir())) == 1
+    assert {site["codigo"] for site in appended["consulta"]["sites"]} == {
+        "inelegibilidade_cnj", "tcu_inidoneos",
     }
+    assert submitted_sites == ["inelegibilidade_cnj", "tcu_inidoneos"]
+
+
+def test_manual_portal_session_opens_link_without_running_automation(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    submitted = []
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda *args, **kwargs: submitted.append(args))
+    client = TestClient(app)
+
+    response = client.post("/api/v1/consultas/manual", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "site": "cndt",
+    })
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["url"] == "https://cndt-certidao.tst.jus.br/"
+    assert body["nome_pdf"] == "cndt.pdf"
+    assert body["status"] == "aguardando_manual"
+    assert body["consulta"]["sites"][0]["status"] == "aguardando_manual"
+    assert Path(body["pasta_destino"]).is_dir()
+    assert submitted == []
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=400)
+    with (Path(body["pasta_destino"]) / "cndt.pdf").open("wb") as pdf_file:
+        writer.write(pdf_file)
+
+    completed = client.get(f"/api/v1/consultas/{body['consulta_id']}").json()["consulta"]
+    assert completed["status"] == "concluida"
+    assert completed["sites"][0]["status"] == "sucesso"
+    assert completed["sites"][0]["resultado"]["pdf_sha256"]
+
+
+def test_manual_portal_reuses_active_consultation_folder(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    client = TestClient(app)
+
+    automated = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["inelegibilidade_cnj"],
+    }).json()
+    consultation_id = automated["consulta_id"]
+    original_folder = Path(automated["pasta_destino"])
+
+    manual = client.post("/api/v1/consultas/manual", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "site": "cndt",
+        "consulta_id": consultation_id,
+    })
+
+    assert manual.status_code == 201
+    body = manual.json()
+    assert body["consulta_id"] == consultation_id
+    assert Path(body["pasta_destino"]) == original_folder
+    assert len(list(output_root.iterdir())) == 1
+    assert {site["codigo"] for site in body["consulta"]["sites"]} == {
+        "inelegibilidade_cnj", "cndt",
+    }
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=400)
+    with (original_folder / "cndt.pdf").open("wb") as pdf_file:
+        writer.write(pdf_file)
+    refreshed = client.get(f"/api/v1/consultas/{consultation_id}").json()["consulta"]
+
+    assert refreshed["pasta_destino"] == str(original_folder.resolve())
+    assert next(site for site in refreshed["sites"] if site["codigo"] == "cndt")["status"] == "sucesso"
+    assert {item["nome"] for item in refreshed["arquivos_pdf"]} == {"cndt.pdf"}
+
+
+def test_automated_consultation_rejects_manual_only_portals(monkeypatch, tmp_path):
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    response = TestClient(app).post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["cndt"],
+    })
+
+    assert response.status_code == 422
+    assert "Macros ainda não implementados" in str(response.json()["detail"])
+
+
+def test_each_captcha_portal_starts_its_own_manual_session(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    submitted = []
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda *args, **kwargs: submitted.append(args))
+    client = TestClient(app)
+    sessions = []
+    for site_code in ("cndt", "ceis_cgu", "cartao_cnpj", "sicaf"):
+        response = client.post("/api/v1/consultas/manual", json={
+            "documento": "12.345.678/0001-95",
+            "tipo": "CNPJ",
+            "site": site_code,
+        })
+        assert response.status_code == 201
+        sessions.append(response.json())
+
+    assert {session["consulta"]["sites"][0]["codigo"] for session in sessions} == {
+        "cndt", "ceis_cgu", "cartao_cnpj", "sicaf",
+    }
+    assert {session["nome_pdf"] for session in sessions} == {
+        "cndt.pdf", "cgu_certidoes.pdf", "receita_cnpj_comprovante.pdf", "compras_gov.pdf",
+    }
+    assert len({session["pasta_destino"] for session in sessions}) == 4
+    assert submitted == []
 
 
 def test_create_consultation_stores_only_document_hash(monkeypatch, tmp_path):
@@ -104,6 +222,61 @@ def test_create_consultation_stores_only_document_hash(monkeypatch, tmp_path):
         columns = {row[1] for row in connection.execute("PRAGMA table_info(consultas)")}
         assert "finalidade" not in columns
         assert connection.execute("SELECT COUNT(*) FROM consulta_auditoria").fetchone()[0] == 1
+
+
+def test_consultation_mirrors_pdfs_saved_manually_into_session_folder(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    client = TestClient(app)
+
+    created = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["inelegibilidade_cnj"],
+    })
+    session_folder = Path(created.json()["pasta_destino"])
+    (session_folder / "cndt.pdf").write_bytes(b"%PDF-1.7\nmanual certificate\n")
+    (session_folder / "incompleto.pdf").write_bytes(b"not a PDF")
+
+    response = client.get(f"/api/v1/consultas/{created.json()['consulta_id']}")
+
+    assert response.status_code == 200
+    files = {item["nome"]: item for item in response.json()["consulta"]["arquivos_pdf"]}
+    assert files["cndt.pdf"]["valido"] is True
+    assert files["cndt.pdf"]["sha256"]
+    assert files["incompleto.pdf"]["valido"] is False
+
+
+def test_merge_consultation_pdfs_uses_requested_order_and_stays_in_session_folder(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    client = TestClient(app)
+    created = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["inelegibilidade_cnj"],
+    })
+    session_folder = Path(created.json()["pasta_destino"])
+    for filename, width in (("first.pdf", 100), ("second.pdf", 300)):
+        writer = PdfWriter()
+        writer.add_blank_page(width=width, height=200)
+        with (session_folder / filename).open("wb") as pdf_file:
+            writer.write(pdf_file)
+
+    response = client.post(
+        f"/api/v1/consultas/{created.json()['consulta_id']}/pdf/unir",
+        json={"arquivos": ["second.pdf", "first.pdf"]},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"].find("certidoes_unificadas.pdf") >= 0
+    assert response.content.startswith(b"%PDF-")
+    merged_path = session_folder / "certidoes_unificadas.pdf"
+    assert merged_path.read_bytes() == response.content
+    merged = PdfReader(merged_path)
+    assert [float(page.mediabox.width) for page in merged.pages] == [300.0, 100.0]
 
 
 def test_migrates_legacy_database_without_finalidade(monkeypatch, tmp_path):
@@ -139,21 +312,78 @@ def test_rejects_invalid_document_and_unknown_site(monkeypatch, tmp_path):
     assert unknown_site.status_code == 422
 
 
-def test_sicaf_request_is_accepted_for_token_assisted_flow(monkeypatch, tmp_path):
+def test_sicaf_uses_separate_manual_token_session(monkeypatch, tmp_path):
     monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
     client = TestClient(app)
 
-    response = client.post(
-        "/api/v1/consultas",
-        json={
-            "documento": "12.345.678/0001-95",
-            "tipo": "CNPJ",
-            "sites": ["sicaf"],
-        },
-    )
+    response = client.post("/api/v1/consultas/manual", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "site": "sicaf",
+    })
 
-    assert response.status_code == 202
-    assert response.json()["consulta"]["sites"][0]["status"] == "pendente"
+    assert response.status_code == 201
+    assert response.json()["url"] == "https://www3.comprasnet.gov.br/sicaf-web/index.jsf"
+    assert response.json()["nome_pdf"] == "compras_gov.pdf"
+    assert response.json()["status"] == "aguardando_manual"
+
+
+def test_simples_nacional_manual_fallback_is_available_for_hcaptcha(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    client = TestClient(app)
+
+    catalog_site = next(
+        site for site in client.get("/api/v1/sites/catalogo").json()["sites"]
+        if site["codigo"] == "simples_nacional"
+    )
+    response = client.post("/api/v1/consultas/manual", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "site": "simples_nacional",
+    })
+
+    assert catalog_site["integration_configured"] is True
+    assert catalog_site["manual_only"] is False
+    assert response.status_code == 201
+    assert response.json()["url"] == web_module.SITE_FLOWS["simples_nacional"]["url"]
+    assert response.json()["nome_pdf"] == "simples_nacional.pdf"
+
+
+def test_simples_nacional_error_continues_manually_in_same_session(monkeypatch, tmp_path):
+    output_root = tmp_path / "downloads"
+    monkeypatch.setenv("CERTHUB_DB_PATH", str(tmp_path / "consultas.sqlite3"))
+    monkeypatch.setattr(web_module, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(
+        web_module,
+        "run_site",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated hCaptcha")),
+    )
+    monkeypatch.setattr(SITE_EXECUTOR, "submit", lambda function, *args: function(*args))
+    client = TestClient(app)
+    created = client.post("/api/v1/consultas", json={
+        "documento": "12.345.678/0001-95",
+        "tipo": "CNPJ",
+        "sites": ["simples_nacional"],
+    })
+    consultation_id = created.json()["consulta_id"]
+    original_folder = Path(created.json()["pasta_destino"])
+
+    fallback = client.post(f"/api/v1/consultas/{consultation_id}/sites/simples_nacional/manual")
+    assert fallback.status_code == 200
+    assert Path(fallback.json()["pasta_destino"]) == original_folder
+    assert fallback.json()["nome_pdf"] == "simples_nacional.pdf"
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=300, height=400)
+    with (original_folder / "simples_nacional.pdf").open("wb") as pdf_file:
+        writer.write(pdf_file)
+
+    completed = client.get(f"/api/v1/consultas/{consultation_id}").json()["consulta"]
+    assert completed["status"] == "concluida"
+    assert completed["sites"][0]["status"] == "sucesso"
+    assert completed["sites"][0]["resultado"]["pdf_sha256"]
 
 
 def test_receita_cpf_requires_birth_date_before_starting(monkeypatch, tmp_path):
@@ -243,9 +473,16 @@ def test_catalog_and_api_status(monkeypatch, tmp_path):
         "simples_nacional": "Consulta Optantes pelo Simples Nacional",
     }
     configured = {site["codigo"] for site in catalog.json()["sites"] if site["integration_configured"]}
-    assert configured == {site["codigo"] for site in catalog.json()["sites"]}
+    manual_captcha_codes = {"cndt", "ceis_cgu", "cartao_cnpj"}
+    manual_codes = manual_captcha_codes | {"sicaf"}
+    assert configured == {site["codigo"] for site in catalog.json()["sites"]} - manual_codes
     catalog_by_code = {site["codigo"]: site for site in catalog.json()["sites"]}
-    assert {code: site["execution_mode"] for code, site in catalog_by_code.items()} == SITE_EXECUTION_MODES
+    expected_modes = {**SITE_EXECUTION_MODES, **{code: "MANUAL" for code in manual_captcha_codes}}
+    assert {code: site["execution_mode"] for code, site in catalog_by_code.items()} == expected_modes
+    assert {code for code, site in catalog_by_code.items() if site["manual_only"]} == manual_codes
+    assert all(not catalog_by_code[code]["integration_configured"] for code in manual_codes)
+    assert catalog_by_code["sicaf"]["manual_mode"] == "token"
+    assert all(catalog_by_code[code]["manual_mode"] == "captcha" for code in manual_captcha_codes)
     assert all(portal["tipo"] == "automacao" for portal in load_certidoes_config()["portais"])
     cnj = next(site for site in catalog.json()["sites"] if site["codigo"] == "inelegibilidade_cnj")
     assert cnj["url"].endswith("consultar_requerido.php?validar=form")

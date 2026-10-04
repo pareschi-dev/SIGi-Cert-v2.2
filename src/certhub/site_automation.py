@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -50,17 +53,14 @@ SITE_FLOWS = {
         "url": "https://servicos.receitafederal.gov.br/servico/certidoes/#/home/cnpj#",
         "document": ["input[placeholder*='CNPJ' i]", "input[name='niContribuinte']"],
         "consult": ["button:has-text('Consultar Certidão')"],
-        "query_form": ["input[placeholder='Selecione a data']", "text=Data Inicial"],
+        "query_url": "/cnpj/consultar",
+        "query_results_url": "/cnpj/consultar/resultado",
         "query_error": [
             "text=Não foi possível concluir a ação",
             "text=023 -",
         ],
-        "query_submit": ["button:has-text('Consultar Certidão')"],
-        "query_results": [
-            "text=Relação das certidões emitidas",
-            "datatable-body-row",
-            "table tbody tr",
-        ],
+        "query_023_retries": 2,
+        "query_023_retry_delay_ms": 60000,
         "latest_second_copy": [
             "datatable-body-row:first-child button[title='Segunda via']",
             "table tbody tr:first-child button[title='Segunda via']",
@@ -210,9 +210,9 @@ def _apply_certidoes_rules(flows: dict[str, dict]) -> dict[str, dict]:
             "botao_emitir_certidao": "emit",
             "botao_emitir_nova_certidao": "emit_new",
             "botao_consultar_certidao": "consult",
-            "botao_consultar_periodo": "query_submit",
-            "formulario_consulta": "query_form",
-            "resultados_consulta": "query_results",
+            # A consulta por período usa o mesmo botão Consultar Certidão:
+            # as datas são preenchidas pelo próprio portal e não são alteradas.
+            "botao_consultar_periodo": "consult",
             "segunda_via_mais_recente": "latest_second_copy",
             "segunda_via": "latest_second_copy",
             "resultado_emissao": "result_notice",
@@ -347,6 +347,9 @@ def _start_visible_browser_for_cdp(cdp_url: str) -> bool:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-notifications",
+            "--disable-translate",
+            "--disable-features=Translate,TranslateUI",
+            "--lang=pt-BR",
         ]
         try:
             subprocess.Popen(
@@ -470,6 +473,21 @@ def _captcha_kind(page, flow: dict) -> tuple[str, str] | None:
         if locator is not None:
             return kind, selectors[0]
     return None
+
+
+def _has_hcaptcha_frame(page) -> bool:
+    """Detect hCaptcha even when its invisible challenge iframe is not visible yet."""
+    for frame in getattr(page, "frames", []):
+        try:
+            if "hcaptcha" in frame.url.lower():
+                return True
+            if frame.locator(
+                "iframe[title*='hCaptcha' i], iframe[src*='hcaptcha' i], .h-captcha, .hcaptcha-box"
+            ).count():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _formatted_document(document: str) -> str:
@@ -659,20 +677,102 @@ def _save_page_as_pdf(page, target: Path, site_name: str) -> None:
     _validate_pdf_file(target, site_name)
 
 
+def _wait_for_manual_pdf(
+    page, target: Path, site_code: str, site_name: str, on_status, instruction: str
+) -> None:
+    """Wait for an operator-saved official PDF in this consultation's folder."""
+    on_status(site_code, "rodando", instruction)
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        try:
+            if target.is_file() and target.stat().st_size >= 8:
+                _validate_pdf_file(target, site_name)
+                return
+        except OSError:
+            pass
+        page.wait_for_timeout(500)
+    raise SiteAutomationError(
+        f"{site_name}: PDF manual não foi salvo em até cinco minutos. "
+        f"Salve como {target.name} na pasta desta sessão."
+    )
+
+
 def _validate_pdf_file(target: Path, site_name: str) -> None:
     if not target.is_file() or target.stat().st_size < 8 or target.read_bytes()[:5] != b"%PDF-":
         target.unlink(missing_ok=True)
         raise SiteAutomationError(f"{site_name}: a saída não é um PDF válido.")
 
 
-def _download_from_click(page, locator, target: Path, site_name: str, timeout_ms: int = 15000) -> None:
+def _write_pdf_response(response, target: Path, site_name: str) -> bool:
+    """Save an official PDF returned directly or base64-wrapped in a JSON response."""
     try:
-        with page.expect_download(timeout=timeout_ms) as download_info:
-            locator.click()
-        download_info.value.save_as(target)
-    except PlaywrightTimeoutError as error:
-        raise SiteAutomationError(f"{site_name}: o portal não iniciou o download do PDF.") from error
+        headers = response.headers
+        content_type = headers.get("content-type", "").lower()
+        body = response.body()
+        if "pdf" in content_type and body.startswith(b"%PDF-"):
+            target.write_bytes(body)
+            _validate_pdf_file(target, site_name)
+            return True
+        if "json" not in content_type:
+            return False
+        payload = json.loads(body)
+    except Exception:
+        return False
+
+    def find_pdf_data(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.lower() in {"pdf", "pdf_base64", "conteudopdf", "arquivo_pdf"} and isinstance(item, str):
+                    encoded = item.partition(",")[2] if item.startswith("data:") else item
+                    try:
+                        decoded = base64.b64decode(encoded, validate=True)
+                    except (ValueError, binascii.Error):
+                        continue
+                    if decoded.startswith(b"%PDF-"):
+                        return decoded
+                nested = find_pdf_data(item)
+                if nested is not None:
+                    return nested
+        elif isinstance(value, list):
+            for item in value:
+                nested = find_pdf_data(item)
+                if nested is not None:
+                    return nested
+        return None
+
+    pdf_bytes = find_pdf_data(payload)
+    if pdf_bytes is None:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(pdf_bytes)
     _validate_pdf_file(target, site_name)
+    return True
+
+
+def _download_from_click(page, locator, target: Path, site_name: str, timeout_ms: int = 15000) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    responses = []
+
+    def collect_response(response):
+        responses.append(response)
+
+    page.on("response", collect_response)
+    try:
+        try:
+            with page.expect_download(timeout=timeout_ms) as download_info:
+                locator.click()
+            download_info.value.save_as(target)
+        except PlaywrightTimeoutError as error:
+            for response in reversed(responses):
+                if _write_pdf_response(response, target, site_name):
+                    return
+            raise SiteAutomationError(f"{site_name}: o portal não iniciou o download do PDF.") from error
+        _validate_pdf_file(target, site_name)
+    finally:
+        try:
+            page.remove_listener("response", collect_response)
+        except Exception:
+            pass
 
 
 def _handle_visible_captcha_if_present(
@@ -686,6 +786,11 @@ def _handle_visible_captcha_if_present(
     if captcha is None:
         return False
     if flow.get("execution_mode") == "INTERNO":
+        if site_code == "simples_nacional" and captcha[0] == "hcaptcha":
+            raise SiteAutomationError(
+                "Simples Nacional: a Receita apresentou hCaptcha. A consulta headless foi interrompida; "
+                "não tentamos resolver nem contornar o desafio e nenhum PDF foi emitido."
+            )
         raise SiteAutomationError(
             "Desafio inesperado em portal INTERNO; consulta interrompida sem abrir janela nem contornar CAPTCHA."
         )
@@ -712,19 +817,15 @@ def _run_receita_cpf_macro(page, flow: dict, document: str, birth_date: str, tar
     _download_from_click(page, download_button, target, "Receita CPF")
 
 
-def _run_receita_cnpj_macro(page, flow: dict, document: str, target: Path) -> None:
+def _run_receita_cnpj_macro(
+    page,
+    flow: dict,
+    document: str,
+    target: Path,
+    on_status: StatusHandler | None = None,
+) -> None:
     """Run the Receita CNPJ query flow without falling through to a different issuance path."""
-    document_locator = _wait_for_visible_locator(page, flow["document"], timeout_ms=15000)
-    if document_locator is None:
-        raise SiteAutomationError("Receita CNPJ: campo CNPJ não localizado na página de consulta.")
-    document_locator.fill(_formatted_document(re.sub(r"\D", "", document)))
-
-    consult_button = _wait_for_visible_locator(page, flow["consult"], timeout_ms=15000)
-    if consult_button is None:
-        raise SiteAutomationError("Receita CNPJ: botão Consultar Certidão não localizado.")
-    consult_button.click()
-
-    def wait_for_state(page, state_keys: tuple[str, ...], timeout_ms: int, timeout_message: str) -> str:
+    def wait_for_url(page, fragment: str, timeout_ms: int, timeout_message: str) -> None:
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
             error_notice = _visible_locator(page, flow.get("query_error", []))
@@ -742,39 +843,80 @@ def _run_receita_cnpj_macro(page, flow: dict, document: str, target: Path) -> No
                     "Receita CNPJ: o portal oficial informou que não foi possível concluir a consulta. "
                     "Nenhum PDF foi emitido."
                 )
-            for state_key in state_keys:
-                if _visible_locator(page, flow[state_key]) is not None:
-                    return state_key
+            route = page.url.split("#", 1)[-1].rstrip("#")
+            if route.endswith(fragment):
+                return
             page.wait_for_timeout(250)
         raise SiteAutomationError(timeout_message)
 
-    first_state = wait_for_state(
-        page,
-        ("query_form", "latest_second_copy", "query_results"),
-        timeout_ms=flow.get("query_form_timeout_ms", 30000),
-        timeout_message=(
-            "Receita CNPJ: após a primeira consulta, o formulário 'Data Inicial' não apareceu. "
-            "O fluxo foi interrompido nessa etapa; nenhuma emissão alternativa foi iniciada."
-        ),
-    )
+    retries = max(0, int(flow.get("query_023_retries", 2)))
+    retry_delay_ms = max(0, int(flow.get("query_023_retry_delay_ms", 60000)))
+    attempt = 0
+    while True:
+        if attempt:
+            # O 023 é uma indisponibilidade temporária do serviço, não um seletor
+            # quebrado. Reinicie o fluxo oficial após a pausa, sem gerar emissão
+            # alternativa nem repetir indefinidamente.
+            if on_status is not None:
+                on_status(
+                    "receita_inss_cnpj",
+                    "rodando",
+                    f"Portal Receita retornou erro 023; tentativa {attempt + 1}/{retries + 1} "
+                    f"em {retry_delay_ms * attempt // 1000} segundos.",
+                )
+            page.wait_for_timeout(retry_delay_ms * attempt)
+            page.goto(flow["url"], wait_until="domcontentloaded", timeout=60000)
 
-    if first_state == "latest_second_copy":
-        download_button = _visible_locator(page, flow["latest_second_copy"])
-        _download_from_click(page, download_button, target, "Receita CNPJ")
-        return
+        document_locator = _wait_for_visible_locator(page, flow["document"], timeout_ms=15000)
+        if document_locator is None:
+            raise SiteAutomationError("Receita CNPJ: campo CNPJ não localizado na página de consulta.")
+        document_locator.fill(_formatted_document(re.sub(r"\D", "", document)))
 
-    if first_state == "query_form":
-        query_submit = _wait_for_visible_locator(page, flow["query_submit"], timeout_ms=15000)
-        if query_submit is None:
-            raise SiteAutomationError("Receita CNPJ: botão da segunda consulta não localizado após 'Data Inicial'.")
-        query_submit.click()
+        consult_button = _wait_for_visible_locator(page, flow["consult"], timeout_ms=15000)
+        if consult_button is None:
+            raise SiteAutomationError("Receita CNPJ: botão Consultar Certidão não localizado.")
+        consult_button.click()
 
-    wait_for_state(
-        page,
-        ("query_results",),
-        timeout_ms=flow.get("query_results_timeout_ms", 30000),
-        timeout_message="Receita CNPJ: tabela de certidões emitidas não apareceu após a consulta.",
-    )
+        try:
+            wait_for_url(
+                page,
+                flow.get("query_url", "/cnpj/consultar"),
+                timeout_ms=flow.get("query_form_timeout_ms", 30000),
+                timeout_message=(
+                    "Receita CNPJ: após a primeira consulta, o portal não abriu a etapa de consulta "
+                    "(/cnpj/consultar). As datas padrão não foram alteradas e nenhuma emissão alternativa foi iniciada."
+                ),
+            )
+
+            # O portal já carrega Data Inicial/Data Final preenchidas por padrão;
+            # não preencher nem alterar esses campos. Apenas consultar.
+            consult_again = _wait_for_visible_locator(page, flow["consult"], timeout_ms=15000)
+            if consult_again is None:
+                raise SiteAutomationError(
+                    "Receita CNPJ: botão da segunda consulta não localizado na etapa /cnpj/consultar."
+                )
+            consult_again.click()
+
+            wait_for_url(
+                page,
+                flow.get("query_results_url", "/cnpj/consultar/resultado"),
+                timeout_ms=flow.get("query_results_timeout_ms", 30000),
+                timeout_message=(
+                    "Receita CNPJ: após a segunda consulta, o portal não abriu "
+                    "/cnpj/consultar/resultado; nenhuma emissão alternativa foi iniciada."
+                ),
+            )
+            break
+        except SiteAutomationError as error:
+            if "erro 023" not in str(error).lower() or attempt >= retries:
+                if "erro 023" in str(error).lower() and retries:
+                    raise SiteAutomationError(
+                        f"Receita CNPJ: portal oficial retornou erro 023 após {attempt + 1} tentativa(s); "
+                        "o serviço não concluiu a consulta. Nenhum PDF foi emitido."
+                    ) from error
+                raise
+            attempt += 1
+
     download_button = _wait_for_visible_locator(page, flow["latest_second_copy"], timeout_ms=15000)
     if download_button is None:
         raise SiteAutomationError("Receita CNPJ: ação '2ª Via' da certidão mais recente não localizada.")
@@ -795,27 +937,20 @@ def _run_cndt_macro(page, flow: dict, document: str, target: Path, on_status, on
     document_locator.fill(_formatted_document(re.sub(r"\D", "", document)))
     _required_locator(page, flow["submit"], "CNDT: botão Emitir Certidão não localizado.")
 
-    downloads = []
-    # Playwright wraps Python callbacks and stores bookkeeping on the callable;
-    # built-in bound methods such as list.append do not allow that attribute.
-    page.on("download", lambda download: downloads.append(download))
     page.bring_to_front()
     on_status("cndt", "aguardando_captcha", None)
     answer = on_captcha("cndt", "imagem", None, None)
     if answer is None:
         raise SiteAutomationError("CNDT: o operador não confirmou a emissão dentro do prazo de cinco minutos.")
 
-    on_status("cndt", "rodando", None)
-    deadline = time.monotonic() + 300
-    while not downloads and time.monotonic() < deadline:
-        page.wait_for_timeout(250)
-    if not downloads:
-        raise SiteAutomationError("CNDT: nenhum PDF foi baixado. Na aba do TST, preencha o CAPTCHA e clique em Emitir Certidão antes de confirmar no painel.")
-    try:
-        downloads[0].save_as(target)
-    except Exception as error:
-        raise SiteAutomationError("CNDT: não foi possível salvar o PDF iniciado pelo operador.") from error
-    _validate_pdf_file(target, "CNDT")
+    _wait_for_manual_pdf(
+        page,
+        target,
+        "cndt",
+        "CNDT",
+        on_status,
+        f"Na aba oficial do TST, conclua a emissão e salve como {target.name} na pasta mostrada no card 'Pasta da sessão'.",
+    )
 
 
 def _run_cgu_macro(page, flow: dict, document: str, target: Path, on_status, on_captcha) -> None:
@@ -844,7 +979,16 @@ def _run_cgu_macro(page, flow: dict, document: str, target: Path, on_status, on_
     certificate_button = _visible_locator(page, flow["certificate_button"])
     if certificate_button is None:
         raise SiteAutomationError("CGU: botão Certidão não encontrado na página de resultados.")
-    _download_from_click(page, certificate_button, target, "CGU")
+    page.bring_to_front()
+    on_status("ceis_cgu", "rodando", "Na aba oficial da CGU, clique em Certidão e salve manualmente o PDF na pasta da sessão.")
+    _wait_for_manual_pdf(
+        page,
+        target,
+        "ceis_cgu",
+        "CGU",
+        on_status,
+        f"Salve a certidão oficial da CGU como {target.name} na pasta mostrada no card 'Pasta da sessão'.",
+    )
 
 
 def _run_cartao_cnpj_macro(page, flow: dict, document: str, target: Path, on_status, on_captcha) -> None:
@@ -857,7 +1001,15 @@ def _run_cartao_cnpj_macro(page, flow: dict, document: str, target: Path, on_sta
     if _handle_visible_captcha_if_present(page, "cartao_cnpj", flow, on_status, on_captcha):
         _click_required(page, flow["submit"], "Comprovante CNPJ: botão CONSULTAR sumiu após resolver o CAPTCHA.")
     _wait_for_url_fragment(page, flow["result_url"], "Comprovante CNPJ", timeout_ms=20000)
-    _save_page_as_pdf(page, target, "Comprovante CNPJ")
+    page.bring_to_front()
+    _wait_for_manual_pdf(
+        page,
+        target,
+        "cartao_cnpj",
+        "Comprovante CNPJ",
+        on_status,
+        f"Na página oficial do comprovante, use a opção de baixar/imprimir e salve como {target.name} na pasta mostrada no card 'Pasta da sessão'.",
+    )
 
 
 def _run_tcu_macro(page, flow: dict, document: str, document_type: str, target: Path) -> None:
@@ -882,8 +1034,25 @@ def _run_simples_nacional_macro(page, flow: dict, document: str, target: Path, o
     _handle_visible_captcha_if_present(page, "simples_nacional", flow, on_status, on_captcha)
     _click_required(page, flow["submit"], "Simples Nacional: botão Consultar não localizado.")
     _handle_visible_captcha_if_present(page, "simples_nacional", flow, on_status, on_captcha)
-    if _wait_for_visible_locator(page, flow["result_notice"], timeout_ms=20000) is None:
-        raise SiteAutomationError("Simples Nacional: resultado Situação Atual não apareceu.")
+    result_deadline = time.monotonic() + flow.get("result_timeout_ms", 20000) / 1000
+    result_found = False
+    while time.monotonic() < result_deadline:
+        if _visible_locator(page, flow["result_notice"]) is not None:
+            result_found = True
+            break
+        _handle_visible_captcha_if_present(page, "simples_nacional", flow, on_status, on_captcha)
+        page.wait_for_timeout(250)
+    if not result_found:
+        if _has_hcaptcha_frame(page):
+            raise SiteAutomationError(
+                "Simples Nacional: a Receita carregou um iframe hCaptcha após Consultar, "
+                "mas o desafio não ficou visível para resolução automática (proibida). "
+                "A consulta headless foi interrompida; abra o portal manualmente para concluir e salvar o PDF."
+            )
+        raise SiteAutomationError(
+            "Simples Nacional: o portal não mostrou 'Situação Atual' após Consultar. "
+            "A consulta não avançou para o resultado e nenhum PDF foi emitido."
+        )
     more_info = _visible_locator(page, flow["more_info"])
     if more_info is not None:
         more_info.click()
@@ -1094,7 +1263,7 @@ def run_site(
                 )
             else:
                 browser = playwright.chromium.launch(headless=True)
-                context = browser.new_context(accept_downloads=True)
+                context = browser.new_context(accept_downloads=True, locale="pt-BR")
                 page = context.new_page()
             pdf_responses = []
 
@@ -1118,7 +1287,7 @@ def run_site(
                 return _build_pdf_result(site_code, flow, target)
 
             if site_code == "receita_inss_cnpj":
-                _run_receita_cnpj_macro(page, flow, document, target)
+                _run_receita_cnpj_macro(page, flow, document, target, on_status)
                 return _build_pdf_result(site_code, flow, target)
 
             if site_code == "cndt":

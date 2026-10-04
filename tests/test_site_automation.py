@@ -1,3 +1,5 @@
+import base64
+import json
 from types import SimpleNamespace
 from pathlib import Path
 import threading
@@ -18,6 +20,7 @@ from certhub.site_automation import (
     _run_sicaf_token_flow,
     _run_simples_nacional_macro,
     _run_tcu_macro,
+    _download_from_click,
     _visible_locator,
     _visible_browser_slot_kind,
     _acquire_visible_browser_slot,
@@ -34,6 +37,15 @@ class FakeDownload:
 
     def save_as(self, path):
         path.write_bytes(b"%PDF-1.4\n%valid test fixture\n")
+
+
+class FakeResponse:
+    def __init__(self, body, content_type="application/json"):
+        self.headers = {"content-type": content_type}
+        self._body = body
+
+    def body(self):
+        return self._body
 
 
 class FakeDownloadExpectation:
@@ -91,6 +103,8 @@ class FakeLocator:
     def click(self):
         self.page.clicked.append(self.selector)
         flow = self.page.flow
+        if flow.get("fake_response") and self.page.response_callback:
+            self.page.response_callback(flow["fake_response"])
         if flow.get("consult") and self.selector == flow["consult"][0]:
             self.page.documents_at_consult.append(self.page.filled.get(flow["document"][0]))
         if flow.get("entry") and self.selector == flow["entry"][0]:
@@ -108,13 +122,21 @@ class FakeLocator:
                 self.page.visible_selectors.add(flow["latest_second_copy"][0])
         if flow.get("consult") and self.selector == flow["consult"][0]:
             self.page.consult_clicks += 1
-            if flow.get("fake_query_error"):
+            if self.page.consult_clicks == 1:
+                self.page.query_attempts += 1
+                if flow.get("fake_query_form", True):
+                    self.page.url = "https://portal.test/servico/certidoes/#/home/cnpj/consultar"
+            elif self.page.consult_clicks == 2:
+                if flow.get("fake_query_results", True):
+                    self.page.url = "https://portal.test/servico/certidoes/#/home/cnpj/consultar/resultado"
+                    self.page.visible_selectors.add(flow["latest_second_copy"][0])
+            should_fail_query = flow.get("fake_query_error") and (
+                self.page.query_attempts <= flow.get("fake_query_error_attempts", 999)
+            )
+            if should_fail_query:
                 self.page.visible_selectors.update(flow["query_error"])
-            if self.page.consult_clicks == 1 and flow.get("query_form") and flow.get("fake_query_form", True):
-                self.page.visible_selectors.add(flow["query_form"][0])
-            elif self.page.consult_clicks == 2 and flow.get("query_results") and flow.get("fake_query_results", True):
-                self.page.visible_selectors.add(flow["query_results"][0])
-                self.page.visible_selectors.add(flow["latest_second_copy"][0])
+            else:
+                self.page.visible_selectors.difference_update(flow.get("query_error", []))
         if flow.get("search") and self.selector == flow["search"][0]:
             self.page.visible_selectors.add(flow["submit"][0])
         if flow.get("emit") and self.selector == flow["emit"][0]:
@@ -139,8 +161,10 @@ class FakeLocator:
                 self.page.visible_selectors.update(flow["captcha_image"] + flow["captcha_input"])
             if flow.get("download_button"):
                 self.page.visible_selectors.add(flow["download_button"][0])
-            if flow.get("result_notice"):
+            if flow.get("result_notice") and not flow.get("fake_hcaptcha_after_submit") and not flow.get("fake_hidden_hcaptcha_after_submit"):
                 self.page.visible_selectors.add(flow["result_notice"][0])
+            if flow.get("fake_hcaptcha_after_submit"):
+                self.page.delayed_selector = flow["captcha_hcaptcha"][0]
             if flow.get("result_url"):
                 self.page.url = f"https://portal.test{flow['result_url']}"
                 if flow.get("certificate_button"):
@@ -183,12 +207,18 @@ class FakePage:
         self.clicked = []
         self.documents_at_consult = []
         self.consult_clicks = 0
+        self.query_attempts = 0
+        self.goto_calls = 0
         self.submit_clicks = 0
         self.delayed_selector = None
         self.waits = 0
 
     def goto(self, url, **kwargs):
         self.url = url
+        self.goto_calls += 1
+        if self.goto_calls > 1 and self.flow.get("consult"):
+            self.visible_selectors = {self.flow["document"][0], self.flow["consult"][0]}
+            self.consult_clicks = 0
 
     def locator(self, selector):
         return FakeLocator(self, selector)
@@ -199,6 +229,10 @@ class FakePage:
             self.download_callback = callback
         else:
             self.response_callback = callback
+
+    def remove_listener(self, event, callback):
+        if event == "response" and getattr(self, "response_callback", None) is callback:
+            self.response_callback = None
 
     def expect_download(self, timeout):
         failures = self.flow.get("download_failures", 0)
@@ -290,14 +324,18 @@ def test_run_site_fills_submits_and_accepts_only_pdf_download(monkeypatch, tmp_p
 
     def operator_submits_in_portal(*args):
         captcha_calls.append(args)
-        manager.browser.page.download_callback(FakeDownload())
         return "concluido"
+
+    def save_manual_cndt(*args):
+        statuses.append(args)
+        if args[0] == "cndt" and args[1] == "rodando" and args[2]:
+            (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual test\n")
 
     result = run_site(
         "consultation-id",
         "cndt",
         "12345678000195",
-        lambda *args: statuses.append(args),
+        save_manual_cndt,
         operator_submits_in_portal,
         tmp_path,
     )
@@ -307,7 +345,9 @@ def test_run_site_fills_submits_and_accepts_only_pdf_download(monkeypatch, tmp_p
     assert manager.browser.page.clicked == []
     assert result["pdf_path"].endswith("cndt.pdf")
     assert len(result["pdf_sha256"]) == 64
-    assert statuses == [("cndt", "rodando", None), ("cndt", "aguardando_captcha", None), ("cndt", "rodando", None)]
+    assert statuses[0:2] == [("cndt", "rodando", None), ("cndt", "aguardando_captcha", None)]
+    assert statuses[-1][0:2] == ("cndt", "rodando")
+    assert "cndt.pdf" in statuses[-1][2]
     assert captcha_calls == [("cndt", "imagem", None, None)]
 
 
@@ -338,8 +378,8 @@ def test_fgts_enters_digits_and_prints_certificate_to_pdf(monkeypatch, tmp_path)
     ]
     assert result["pdf_path"].endswith("fgts_crf.pdf")
     assert Path(result["pdf_path"]).read_bytes().startswith(b"%PDF-")
-    assert manager.launch_calls == []
-    assert manager.cdp_urls == ["http://127.0.0.1:9222"]
+    assert manager.launch_calls == [{"headless": True}]
+    assert manager.cdp_urls == []
     assert captcha_calls == []
 
 
@@ -374,14 +414,17 @@ def test_cndt_keeps_operator_submission_in_cdp_tab(monkeypatch, tmp_path):
         assert kind == "imagem"
         assert image is None
         assert selector is None
-        page.download_callback(FakeDownload())
         return "concluido"
+
+    def save_cndt_pdf(site, status, detail):
+        if site == "cndt" and status == "rodando" and detail:
+            (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual test\n")
 
     run_site(
         "consultation-id",
         "cndt",
         "12345678000195",
-        lambda *args: None,
+        save_cndt_pdf,
         human_emits_certificate_in_portal,
         tmp_path,
     )
@@ -402,12 +445,15 @@ def test_cndt_download_listener_uses_assignable_callback_and_saves_manual_pdf(mo
     monkeypatch.setattr("certhub.site_automation.get_env_var", lambda _name, default=None: default)
 
     def operator_emits_and_confirms(*_args):
-        page.download_callback(FakeDownload())
         return "concluido"
+
+    def save_cndt_pdf(_site, status, detail):
+        if status == "rodando" and detail:
+            (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual test\n")
 
     result = run_site(
         "consultation-id", "cndt", "12345678000195",
-        lambda *_args: None, operator_emits_and_confirms, tmp_path,
+        save_cndt_pdf, operator_emits_and_confirms, tmp_path,
     )
 
     assert Path(result["pdf_path"]).read_bytes().startswith(b"%PDF-")
@@ -427,8 +473,8 @@ def test_cdp_url_is_loaded_from_project_environment(monkeypatch, tmp_path):
         "consultation-id",
         "cndt",
         "12345678000195",
-        lambda *args: None,
-        lambda *_args: (page.download_callback(FakeDownload()), "concluido")[1],
+        lambda *args: (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual\n") if args[1] == "rodando" and args[2] else None,
+        lambda *_args: "concluido",
         tmp_path,
     )
 
@@ -476,8 +522,8 @@ def test_visible_browser_is_started_automatically_when_cdp_is_unavailable(monkey
         "consultation-id",
         "cndt",
         "12345678000195",
-        lambda *args: None,
-        lambda *_args: (manager.browser.page.download_callback(FakeDownload()), "concluido")[1],
+        lambda *args: (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual\n") if args[1] == "rodando" and args[2] else None,
+        lambda *_args: "concluido",
         tmp_path,
     )
 
@@ -515,12 +561,12 @@ def test_cnpj_captcha_flow_opens_a_dedicated_tab_instead_of_reusing_blank(monkey
     monkeypatch.setattr("certhub.site_automation.get_env_var", lambda _name, default=None: default)
 
     def operator_downloads(*_args):
-        page.download_callback(FakeDownload())
         return "concluido"
 
     run_site(
         "consultation-id", "cndt", "12345678000195",
-        lambda *args: None, operator_downloads, tmp_path,
+        lambda *args: (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual\n") if args[1] == "rodando" and args[2] else None,
+        operator_downloads, tmp_path,
     )
 
     assert manager.browser.new_page_calls == 1
@@ -646,7 +692,7 @@ def test_receita_cnpj_downloads_second_copy_of_most_recent_certificate(monkeypat
     assert page.filled[flow["document"][0]] == "12.345.678/0001-95"
     assert page.clicked == [
         flow["consult"][0],
-        flow["query_submit"][0],
+        flow["consult"][0],
         flow["latest_second_copy"][0],
     ]
     assert result["pdf_path"].endswith("receita_cnpj.pdf")
@@ -660,7 +706,7 @@ def test_receita_cnpj_falls_back_to_new_emission_if_query_has_no_rows(monkeypatc
     manager = FakePlaywrightManager(flow)
     monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
 
-    with pytest.raises(SiteAutomationError, match="tabela de certidões emitidas não apareceu"):
+    with pytest.raises(SiteAutomationError, match="/cnpj/consultar/resultado"):
         run_site(
             "consultation-id",
             "receita_inss_cnpj",
@@ -670,7 +716,7 @@ def test_receita_cnpj_falls_back_to_new_emission_if_query_has_no_rows(monkeypatc
             tmp_path,
         )
 
-    assert manager.browser.page.clicked == [flow["consult"][0], flow["query_submit"][0]]
+    assert manager.browser.page.clicked == [flow["consult"][0], flow["consult"][0]]
 
 
 def test_receita_cnpj_falls_back_to_emission_if_query_form_is_unavailable(monkeypatch, tmp_path):
@@ -681,7 +727,7 @@ def test_receita_cnpj_falls_back_to_emission_if_query_form_is_unavailable(monkey
     manager = FakePlaywrightManager(flow)
     monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
 
-    with pytest.raises(SiteAutomationError, match="formulário 'Data Inicial' não apareceu"):
+    with pytest.raises(SiteAutomationError, match="/cnpj/consultar"):
         run_site(
             "consultation-id",
             "receita_inss_cnpj",
@@ -702,7 +748,7 @@ def test_receita_cnpj_does_not_switch_to_emission_when_query_form_is_missing(mon
     monkeypatch.setattr("certhub.site_automation.SITE_FLOWS", {**SITE_FLOWS, "receita_inss_cnpj": flow})
     monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
 
-    with pytest.raises(SiteAutomationError, match="formulário 'Data Inicial' não apareceu"):
+    with pytest.raises(SiteAutomationError, match="/cnpj/consultar"):
         run_site(
             "consultation-id",
             "receita_inss_cnpj",
@@ -717,7 +763,6 @@ def test_receita_cnpj_does_not_switch_to_emission_when_query_form_is_missing(mon
 
 def test_receita_cnpj_fills_document_before_first_consult_and_uses_two_step_query(monkeypatch, tmp_path):
     flow = dict(SITE_FLOWS["receita_inss_cnpj"])
-    flow["query_form_timeout_ms"] = 1
     monkeypatch.setattr("certhub.site_automation.SITE_FLOWS", {**SITE_FLOWS, "receita_inss_cnpj": flow})
     manager = FakePlaywrightManager(flow)
     monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
@@ -733,17 +778,22 @@ def test_receita_cnpj_fills_document_before_first_consult_and_uses_two_step_quer
 
     assert manager.browser.page.clicked == [
         flow["consult"][0],
-        flow["query_submit"][0],
+        flow["consult"][0],
         flow["latest_second_copy"][0],
     ]
-    assert manager.browser.page.documents_at_consult == ["12.345.678/0001-95", "12.345.678/0001-95"]
+    assert manager.browser.page.documents_at_consult == [
+        "12.345.678/0001-95",
+        "12.345.678/0001-95",
+    ]
+    assert manager.browser.page.filled == {flow["document"][0]: "12.345.678/0001-95"}
     assert Path(result["pdf_path"]).read_bytes().startswith(b"%PDF-")
 
 
 def test_receita_cnpj_reports_official_portal_error_023_without_waiting_for_data_form(monkeypatch, tmp_path):
     flow = dict(SITE_FLOWS["receita_inss_cnpj"])
     flow["fake_query_error"] = True
-    flow["query_form_timeout_ms"] = 1
+    flow["query_023_retries"] = 1
+    flow["query_023_retry_delay_ms"] = 1000
     monkeypatch.setattr("certhub.site_automation.SITE_FLOWS", {**SITE_FLOWS, "receita_inss_cnpj": flow})
     manager = FakePlaywrightManager(flow)
     monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
@@ -758,8 +808,45 @@ def test_receita_cnpj_reports_official_portal_error_023_without_waiting_for_data
             tmp_path,
         )
 
-    assert manager.browser.page.clicked == [flow["consult"][0]]
+    assert manager.browser.page.clicked == [flow["consult"][0], flow["consult"][0]]
+    assert manager.browser.page.goto_calls == 2
     assert not (tmp_path / "receita_cnpj.pdf").exists()
+
+
+def test_receita_cnpj_retries_transient_error_023_and_downloads_pdf(monkeypatch, tmp_path):
+    flow = dict(SITE_FLOWS["receita_inss_cnpj"])
+    flow.update(
+        fake_query_error=True,
+        fake_query_error_attempts=1,
+        query_023_retry_delay_ms=1000,
+    )
+    monkeypatch.setattr("certhub.site_automation.SITE_FLOWS", {**SITE_FLOWS, "receita_inss_cnpj": flow})
+    manager = FakePlaywrightManager(flow)
+    monkeypatch.setattr("certhub.site_automation.sync_playwright", lambda: manager)
+    statuses = []
+
+    result = run_site(
+        "consultation-id",
+        "receita_inss_cnpj",
+        "12345678000195",
+        lambda *args: statuses.append(args),
+        lambda *args: None,
+        tmp_path,
+    )
+
+    assert manager.browser.page.clicked == [
+        flow["consult"][0],
+        flow["consult"][0],
+        flow["consult"][0],
+        flow["latest_second_copy"][0],
+    ]
+    assert manager.browser.page.documents_at_consult == [
+        "12.345.678/0001-95",
+        "12.345.678/0001-95",
+        "12.345.678/0001-95",
+    ]
+    assert any("tentativa 2/3" in (status[2] or "") for status in statuses)
+    assert Path(result["pdf_path"]).read_bytes().startswith(b"%PDF-")
 
 
 def test_receita_cnpj_detects_recaptcha():
@@ -845,13 +932,13 @@ def test_all_ten_catalog_flows_are_registered_with_the_required_modes():
     expected_modes = {
         "receita_inss_cnpj": "INTERNO",
         "receita_inss_cpf": "INTERNO",
-        "fgts": "VISÍVEL",
+        "fgts": "INTERNO",
         "cndt": "VISÍVEL/CAPTCHA",
         "inelegibilidade_cnj": "INTERNO",
         "ceis_cgu": "VISÍVEL/CAPTCHA",
         "cartao_cnpj": "VISÍVEL/CAPTCHA",
         "tcu_inidoneos": "INTERNO",
-        "simples_nacional": "VISÍVEL",
+        "simples_nacional": "INTERNO",
         "sicaf": "TOKEN",
     }
 
@@ -919,15 +1006,18 @@ def test_cndt_captures_pdf_after_operator_submits_in_portal_tab(tmp_path):
     status_events = []
 
     def human_submits_in_tab(*args):
-        page.download_callback(FakeDownload())
         return "concluido"
+
+    def save_cndt_pdf(_site, status, detail):
+        if status == "rodando" and detail:
+            (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual test\n")
 
     _run_cndt_macro(
         page,
         flow,
         "12345678000195",
         tmp_path / "cndt.pdf",
-        lambda *args: status_events.append(args),
+        lambda *args: (status_events.append(args), save_cndt_pdf(*args)),
         human_submits_in_tab,
     )
 
@@ -946,12 +1036,15 @@ def test_cndt_waits_for_operator_to_solve_and_submit_without_clicking_for_them(t
     statuses = []
 
     def human_solves_and_submits(*_args):
-        page.download_callback(FakeDownload())
         return "concluido"
+
+    def save_cndt_pdf(_site, status, detail):
+        if status == "rodando" and detail:
+            (tmp_path / "cndt.pdf").write_bytes(b"%PDF-1.4\nmanual test\n")
 
     _run_cndt_macro(
         page, flow, "12345678000195", tmp_path / "cndt.pdf",
-        lambda *args: statuses.append(args), human_solves_and_submits,
+        lambda *args: (statuses.append(args), save_cndt_pdf(*args)), human_solves_and_submits,
     )
 
     assert page.filled["#cpfCnpj"] == "12.345.678/0001-95"
@@ -971,20 +1064,26 @@ def test_cndt_uses_the_tst_cnpj_field_not_the_site_search_box():
     assert flow["submit"][0] == "#botao-emitir"
 
 
-def test_cgu_selects_private_negative_certificate_and_downloads(tmp_path):
+def test_cgu_selects_private_negative_certificate_and_waits_for_manual_pdf(tmp_path):
     flow = {
         "private_entity": ["radio.private"], "negative_certificate": ["input.negative"],
         "document": ["input.doc"], "submit": ["button.consultar"],
         "result_url": "/resultado-consulta-responsabilizacao/", "certificate_button": ["button.certidao"],
     }
     page = _minimal_page(flow)
+    target = tmp_path / "cgu_certidoes.pdf"
 
-    _run_cgu_macro(page, flow, "12345678000195", tmp_path / "cgu_certidoes.pdf", lambda *args: None, lambda *args: None)
+    def operator_saves_pdf(site, status, detail):
+        if status == "rodando" and detail:
+            target.write_bytes(b"%PDF-1.4\nmanual test\n")
+
+    _run_cgu_macro(page, flow, "12345678000195", target, operator_saves_pdf, lambda *args: None)
 
     assert page.clicked[0] == "radio.private"
     assert page.values["input.negative"] == "checked"
     assert page.filled["input.doc"] == "12345678000195"
-    assert (tmp_path / "cgu_certidoes.pdf").read_bytes().startswith(b"%PDF-")
+    assert "button.certidao" not in page.clicked
+    assert target.read_bytes().startswith(b"%PDF-")
 
 
 def test_cgu_uses_public_homepage_and_emission_entrypoint():
@@ -1008,15 +1107,20 @@ def test_cgu_login_gate_fails_explicitly_without_claiming_success(tmp_path):
     assert not (tmp_path / "cgu_certidoes.pdf").exists()
 
 
-def test_receita_cnpj_comprovante_prints_result_page_pdf(tmp_path):
+def test_receita_cnpj_comprovante_waits_for_manually_saved_pdf(tmp_path):
     flow = {"document": ["input.cnpj"], "submit": ["button.consultar"], "result_url": "/comprovante"}
     page = _minimal_page(flow)
+    target = tmp_path / "receita_cnpj_comprovante.pdf"
 
-    _run_cartao_cnpj_macro(page, flow, "08037769000196", tmp_path / "receita_cnpj_comprovante.pdf", lambda *args: None, lambda *args: None)
+    def operator_saves_pdf(site, status, detail):
+        if status == "rodando" and detail:
+            target.write_bytes(b"%PDF-1.4\nmanual test\n")
+
+    _run_cartao_cnpj_macro(page, flow, "08037769000196", target, operator_saves_pdf, lambda *args: None)
 
     assert page.filled["input.cnpj"] == "08037769000196"
     assert page.url.endswith("/comprovante")
-    assert (tmp_path / "receita_cnpj_comprovante.pdf").read_bytes().startswith(b"%PDF-")
+    assert target.read_bytes().startswith(b"%PDF-")
 
 
 def test_receita_cnpj_comprovante_uses_masked_cnpj_input():
@@ -1024,6 +1128,21 @@ def test_receita_cnpj_comprovante_uses_masked_cnpj_input():
 
     assert "input[mask='AA.AAA.AAA/AAAA-AA']" in flow["document"]
     assert "input[maxlength='18']" in flow["document"]
+
+
+def test_download_click_saves_base64_pdf_from_official_json_response(tmp_path):
+    pdf_bytes = b"%PDF-1.7\nOfficial Receita certificate fixture\n"
+    body = json.dumps({"status": "Sucesso", "pdf": base64.b64encode(pdf_bytes).decode("ascii")}).encode()
+    flow = {"download_failures": 1, "fake_response": FakeResponse(body)}
+    page = _minimal_page(flow)
+    target = tmp_path / "consulta" / "receita_cnpj.pdf"
+
+    _download_from_click(page, FakeLocator(page, "button.second-copy"), target, "Receita CNPJ")
+
+    assert target.read_bytes() == pdf_bytes
+    assert target.read_bytes().startswith(b"%PDF-")
+    assert target.parent.is_dir()
+    assert page.response_callback is None
 
 
 def test_tcu_switches_document_type_and_downloads_result(tmp_path):
@@ -1050,6 +1169,50 @@ def test_simples_nacional_waits_for_status_and_downloads_generated_pdf(tmp_path)
     assert page.filled["input.cnpj"] == "08037769000196"
     assert page.clicked == ["button.consultar", "button.info", "button.pdf"]
     assert (tmp_path / "simples_nacional.pdf").read_bytes().startswith(b"%PDF-")
+
+
+def test_simples_nacional_reports_hcaptcha_that_appears_after_submit(tmp_path):
+    flow = {
+        "execution_mode": "INTERNO",
+        "document": ["input.cnpj"],
+        "submit": ["button.consultar"],
+        "result_notice": ["text=Situação Atual"],
+        "captcha_hcaptcha": ["iframe[title*='hCaptcha' i]"],
+        "fake_hcaptcha_after_submit": True,
+    }
+    page = FakePage(flow)
+
+    with pytest.raises(SiteAutomationError, match="Simples Nacional: a Receita apresentou hCaptcha"):
+        _run_simples_nacional_macro(
+            page, flow, "08037769000196", tmp_path / "simples_nacional.pdf",
+            lambda *args: None, lambda *args: None,
+        )
+
+    assert page.clicked == ["button.consultar"]
+    assert not (tmp_path / "simples_nacional.pdf").exists()
+
+
+def test_simples_nacional_reports_invisible_hcaptcha_frame_after_submit(tmp_path):
+    flow = {
+        "execution_mode": "INTERNO",
+        "document": ["input.cnpj"],
+        "submit": ["button.consultar"],
+        "result_notice": ["text=Situação Atual"],
+        "captcha_hcaptcha": ["iframe[title*='hCaptcha' i]"],
+        "result_timeout_ms": 1,
+        "fake_hidden_hcaptcha_after_submit": True,
+    }
+    page = FakePage(flow)
+    page.frames = [SimpleNamespace(url="https://newassets.hcaptcha.com/captcha.html")]
+
+    with pytest.raises(SiteAutomationError, match="carregou um iframe hCaptcha"):
+        _run_simples_nacional_macro(
+            page, flow, "08037769000196", tmp_path / "simples_nacional.pdf",
+            lambda *args: None, lambda *args: None,
+        )
+
+    assert page.clicked == ["button.consultar"]
+    assert not (tmp_path / "simples_nacional.pdf").exists()
 
 
 def test_simples_nacional_uses_current_portal_result_and_pdf_ids():

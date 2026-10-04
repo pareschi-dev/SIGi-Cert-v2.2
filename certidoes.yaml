@@ -58,7 +58,7 @@ portais:
     nome: "Certificado de Regularidade do FGTS"
     orgao: "Caixa Econômica Federal"
     tipo: automacao
-    modo: VISÍVEL
+    modo: INTERNO
     implementado: true
     url_inicial: "https://consulta-crf.caixa.gov.br/consultacrf/pages/consultaEmpregador.jsf"
     seletores:
@@ -137,7 +137,7 @@ portais:
     nome: "Consulta Optantes pelo Simples Nacional"
     orgao: "Receita Federal"
     tipo: automacao
-    modo: VISÍVEL
+    modo: INTERNO
     implementado: true
     url_inicial: "https://www8.receita.fazenda.gov.br/simplesnacional/aplicacoes.aspx?id=21"
     seletores:

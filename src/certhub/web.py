@@ -20,6 +20,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pypdf import PdfReader, PdfWriter
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from certhub.core.validators import validate_cnpj, validate_cpf
@@ -33,6 +34,16 @@ from certhub.config import (
 )
 from certhub.site_automation import SITE_FLOWS, _safe_error_detail, run_site
 
+MANUAL_CAPTCHA_SITE_CODES = frozenset(("cndt", "ceis_cgu", "cartao_cnpj"))
+MANUAL_ONLY_SITE_CODES = MANUAL_CAPTCHA_SITE_CODES | {"sicaf"}
+MANUAL_FALLBACK_SITE_CODES = frozenset(("simples_nacional",))
+MANUAL_PDF_FILE_IDS = {
+    "cndt": "cndt",
+    "ceis_cgu": "cgu_certidoes",
+    "cartao_cnpj": "receita_cnpj_comprovante",
+    "sicaf": "compras_gov",
+    "simples_nacional": "simples_nacional",
+}
 
 SITE_CATALOG = [
     {"codigo": "sicaf", "nome": "SICAF — Compras.gov.br", "orgao": "Compras.gov.br", "captcha": "Certificado digital/token", "url": "https://www3.comprasnet.gov.br/sicaf-web/index.jsf"},
@@ -85,7 +96,9 @@ SITE_CODES = {site["codigo"] for site in SITE_CATALOG}
 IMPLEMENTED_SITE_CODES = {
     site_code
     for site_code, config in _PORTAL_CONFIG_BY_CODE.items()
-    if config.get("implementado") is True and site_code in SITE_FLOWS
+    if config.get("implementado") is True
+    and site_code in SITE_FLOWS
+    and site_code not in MANUAL_ONLY_SITE_CODES
 }
 SITE_DOCUMENT_TYPES = {
     "sicaf": {"CNPJ"},
@@ -197,6 +210,7 @@ class ConsultationRequest(BaseModel):
     tipo: Literal["CPF", "CNPJ"]
     sites: list[str] = Field(min_length=1, max_length=10)
     data_nascimento: str | None = Field(default=None, max_length=10)
+    consulta_id: str | None = Field(default=None, max_length=64)
 
     @field_validator("documento", mode="before")
     @classmethod
@@ -247,6 +261,56 @@ class CaptchaResolution(BaseModel):
     resposta: str = Field(min_length=1, max_length=512)
 
 
+class MergePdfsRequest(BaseModel):
+    arquivos: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("arquivos")
+    @classmethod
+    def filenames_must_be_unique_pdf_names(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("A ordem contém nomes de arquivo duplicados.")
+        if any(Path(name).name != name or Path(name).suffix.lower() != ".pdf" for name in value):
+            raise ValueError("Informe somente nomes de arquivos PDF, sem caminhos.")
+        return value
+
+
+class ManualPortalRequest(BaseModel):
+    documento: str = Field(min_length=1, max_length=32)
+    tipo: Literal["CPF", "CNPJ"]
+    site: str
+    consulta_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("documento", mode="before")
+    @classmethod
+    def trim_document(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            if not re.fullmatch(r"[0-9./\-\s]+", value):
+                raise ValueError("Informe apenas os dígitos e a formatação do CPF/CNPJ.")
+        return value
+
+    @field_validator("site")
+    @classmethod
+    def require_manual_portal(cls, value: str) -> str:
+        if value not in MANUAL_ONLY_SITE_CODES | MANUAL_FALLBACK_SITE_CODES:
+            raise ValueError("Este portal não está configurado para abertura manual.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_document(self):
+        digits = re.sub(r"\D", "", self.documento)
+        valid = validate_cpf(digits) if self.tipo == "CPF" else validate_cnpj(digits)
+        expected_length = 11 if self.tipo == "CPF" else 14
+        if len(digits) != expected_length or not valid:
+            raise ValueError(f"{self.tipo} inválido.")
+        if self.tipo not in SITE_DOCUMENT_TYPES[self.site]:
+            raise ValueError(f"O portal {self.site} não aceita {self.tipo}.")
+        return self
+
+    def normalized_document(self) -> str:
+        return re.sub(r"\D", "", self.documento)
+
+
 app = FastAPI(title="SIG-ES | Certidões", version="0.1.0")
 
 
@@ -271,8 +335,10 @@ def site_catalog():
         "sites": [
             {
                 **site,
-                "execution_mode": SITE_EXECUTION_MODES[site["codigo"]],
+                "execution_mode": "MANUAL" if site["codigo"] in MANUAL_CAPTCHA_SITE_CODES else SITE_EXECUTION_MODES[site["codigo"]],
                 "integration_configured": site["codigo"] in IMPLEMENTED_SITE_CODES,
+                "manual_only": site["codigo"] in MANUAL_ONLY_SITE_CODES,
+                "manual_mode": "captcha" if site["codigo"] in MANUAL_CAPTCHA_SITE_CODES else "token" if site["codigo"] == "sicaf" else None,
                 "document_types": sorted(SITE_DOCUMENT_TYPES[site["codigo"]]),
             }
             for site in SITE_CATALOG
@@ -399,12 +465,61 @@ def _serialize_consultation(connection: sqlite3.Connection, consultation_id: str
     consultation_directory = find_consultation_directory(
         row["documento_hash"], row["iniciado_em"], OUTPUT_ROOT
     )
+    pdf_files = []
+    if consultation_directory is not None:
+        for pdf_path in sorted(consultation_directory.glob("*.pdf"), key=lambda item: item.name.casefold()):
+            try:
+                if not pdf_path.is_file():
+                    continue
+                file_bytes = pdf_path.read_bytes()
+                pdf_files.append({
+                    "nome": pdf_path.name,
+                    "tamanho": len(file_bytes),
+                    "valido": file_bytes.startswith(b"%PDF-") and len(file_bytes) >= 8,
+                    "sha256": hashlib.sha256(file_bytes).hexdigest(),
+                    "modificado_em": datetime.fromtimestamp(
+                        pdf_path.stat().st_mtime, UTC
+                    ).isoformat(timespec="seconds"),
+                })
+            except OSError:
+                continue
     serialized_sites = []
+    manual_completion_recorded = False
     for item in site_rows:
         result = json.loads(item["resultado"]) if item["resultado"] else None
+        site_status = item["status"]
+        if (
+            site_status == "aguardando_manual"
+            and item["site_codigo"] in MANUAL_PDF_FILE_IDS
+            and consultation_directory is not None
+        ):
+            manual_pdf = consultation_directory / f"{MANUAL_PDF_FILE_IDS[item['site_codigo']]}.pdf"
+            try:
+                reader = PdfReader(str(manual_pdf), strict=True)
+                if not reader.is_encrypted and len(reader.pages) > 0:
+                    manual_pdf_bytes = manual_pdf.read_bytes()
+                    if manual_pdf_bytes.startswith(b"%PDF-"):
+                        result = {
+                            "arquivo": manual_pdf.name,
+                            "pdf_sha256": hashlib.sha256(manual_pdf_bytes).hexdigest(),
+                            "detalhe": "PDF manual salvo e validado na pasta da sessão.",
+                        }
+                        connection.execute(
+                            "UPDATE consulta_sites SET status = 'sucesso', resultado = ? "
+                            "WHERE consulta_id = ? AND site_codigo = ? AND status = 'aguardando_manual'",
+                            (json.dumps(result, ensure_ascii=False), consultation_id, item["site_codigo"]),
+                        )
+                        _record_event(connection, consultation_id, "site_concluido", {
+                            "site_codigo": item["site_codigo"], "status": "sucesso", "resultado": result,
+                        })
+                        site_status = "sucesso"
+                        manual_completion_recorded = True
+            except Exception:
+                # Keep the manual job pending until the expected file is a readable PDF.
+                pass
         if result is not None:
             result.pop("pdf_path", None)
-            if consultation_directory is not None and item["status"] == "sucesso":
+            if consultation_directory is not None and site_status == "sucesso":
                 flow_code = {
                     "receita_inss_cnpj": "receita_inss_cnpj",
                     "receita_inss_cpf": "receita_inss_cpf",
@@ -417,17 +532,29 @@ def _serialize_consultation(connection: sqlite3.Connection, consultation_id: str
                     result["pdf_path"] = str(pdf_path.resolve())
         serialized_sites.append({
             "codigo": item["site_codigo"],
-            "status": item["status"],
+            "status": site_status,
             "resultado": result,
         })
+    if manual_completion_recorded:
+        statuses = [item["status"] for item in connection.execute(
+            "SELECT status FROM consulta_sites WHERE consulta_id = ?", (consultation_id,)
+        ).fetchall()]
+        overall = "concluida" if statuses and all(state in {"sucesso", "erro", "cancelada"} for state in statuses) else "em_andamento"
+        connection.execute("UPDATE consultas SET status = ? WHERE id = ?", (overall, consultation_id))
+        _record_event(connection, consultation_id, "consulta_atualizada", {"status": overall})
+        connection.commit()
+        current_status = overall
+    else:
+        current_status = row["status"]
     return {
         "id": row["id"],
         "documento_tipo": row["documento_tipo"],
         "documento_mascarado": row["documento_mascarado"],
-        "status": row["status"],
+        "status": current_status,
         "iniciado_em": row["iniciado_em"],
         "pasta_disponivel": consultation_directory is not None,
         "pasta_destino": str(consultation_directory.resolve()) if consultation_directory else None,
+        "arquivos_pdf": pdf_files,
         "sites": serialized_sites,
         "resultados_consolidados": [
             {"site_codigo": item["codigo"], **item["resultado"]}
@@ -441,47 +568,117 @@ def _serialize_consultation(connection: sqlite3.Connection, consultation_id: str
 def create_consultation(request: ConsultationRequest):
     digits = request.normalized_document()
     masked = _mask_document(request.tipo, digits)
-    consultation_id = str(uuid.uuid4())
-    consultation_directory, started_at_value = create_consultation_directory(digits, OUTPUT_ROOT)
-    started_at = started_at_value.isoformat(timespec="seconds")
-    with closing(_connect()) as connection, connection:
-        last_audit = connection.execute(
-            "SELECT registro_hash FROM consulta_auditoria ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        previous = last_audit["registro_hash"] if last_audit else None
-        connection.execute(
-            "INSERT INTO consultas (id, documento_tipo, documento_hash, documento_mascarado, status, iniciado_em) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                consultation_id,
-                request.tipo,
-                hashlib.sha256(digits.encode("ascii")).hexdigest(),
-                masked,
-                "em_andamento",
-                started_at,
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO consulta_sites (id, consulta_id, site_codigo, status) VALUES (?, ?, ?, ?)",
-            [(str(uuid.uuid4()), consultation_id, code, "pendente") for code in request.sites],
-        )
-        _record_event(connection, consultation_id, "consulta_iniciada", {"sites": request.sites, "documento_mascarado": masked})
-        audit_payload = json.dumps(
-            [consultation_id, "iniciada", masked, request.sites, started_at, previous],
-            separators=(",", ":"),
-        )
-        connection.execute(
-            "INSERT INTO consulta_auditoria (consulta_id, acao, documento_mascarado, sites_consultados, timestamp, hash_anterior, registro_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                consultation_id,
-                "iniciada",
-                masked,
-                json.dumps(request.sites),
-                started_at,
-                previous,
-                hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
-            ),
-        )
-        consultation = _serialize_consultation(connection, consultation_id)
+    document_hash = hashlib.sha256(digits.encode("ascii")).hexdigest()
+    consultation_id = request.consulta_id
+    if consultation_id:
+        with closing(_connect()) as connection, connection:
+            existing = connection.execute(
+                "SELECT documento_tipo, documento_hash, iniciado_em FROM consultas WHERE id = ?",
+                (consultation_id,),
+            ).fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Consulta ativa não encontrada.")
+            if existing["documento_tipo"] != request.tipo or existing["documento_hash"] != document_hash:
+                raise HTTPException(status_code=409, detail="A pasta ativa pertence a outro documento.")
+            consultation_directory = find_consultation_directory(
+                existing["documento_hash"], existing["iniciado_em"], OUTPUT_ROOT
+            )
+            if consultation_directory is None:
+                raise HTTPException(status_code=404, detail="Pasta da consulta ativa não encontrada.")
+            current_sites = {
+                row["site_codigo"]: row["status"]
+                for row in connection.execute(
+                    "SELECT site_codigo, status FROM consulta_sites WHERE consulta_id = ?",
+                    (consultation_id,),
+                ).fetchall()
+            }
+            duplicates = [
+                code for code in request.sites
+                if code in current_sites and current_sites[code] != "erro"
+            ]
+            if duplicates:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Já existe uma execução para: {', '.join(duplicates)}.",
+                )
+            for site_code in request.sites:
+                if site_code in current_sites:
+                    connection.execute(
+                        "UPDATE consulta_sites SET status = 'pendente', resultado = NULL "
+                        "WHERE consulta_id = ? AND site_codigo = ?",
+                        (consultation_id, site_code),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO consulta_sites (id, consulta_id, site_codigo, status) VALUES (?, ?, ?, 'pendente')",
+                        (str(uuid.uuid4()), consultation_id, site_code),
+                    )
+            connection.execute(
+                "UPDATE consultas SET status = 'em_andamento' WHERE id = ?",
+                (consultation_id,),
+            )
+            _record_event(connection, consultation_id, "sites_adicionados", {
+                "sites": request.sites, "documento_mascarado": masked,
+            })
+            timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+            previous_audit = connection.execute(
+                "SELECT registro_hash FROM consulta_auditoria ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            previous = previous_audit["registro_hash"] if previous_audit else None
+            audit_payload = json.dumps(
+                [consultation_id, "sites_adicionados", masked, request.sites, timestamp, previous],
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "INSERT INTO consulta_auditoria (consulta_id, acao, documento_mascarado, sites_consultados, timestamp, hash_anterior, registro_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    consultation_id,
+                    "sites_adicionados",
+                    masked,
+                    json.dumps(request.sites),
+                    timestamp,
+                    previous,
+                    hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
+                ),
+            )
+            consultation = _serialize_consultation(connection, consultation_id)
+    else:
+        consultation_id = str(uuid.uuid4())
+        consultation_directory, started_at_value = create_consultation_directory(digits, OUTPUT_ROOT)
+        started_at = started_at_value.isoformat(timespec="seconds")
+        with closing(_connect()) as connection, connection:
+            last_audit = connection.execute(
+                "SELECT registro_hash FROM consulta_auditoria ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            previous = last_audit["registro_hash"] if last_audit else None
+            connection.execute(
+                "INSERT INTO consultas (id, documento_tipo, documento_hash, documento_mascarado, status, iniciado_em) VALUES (?, ?, ?, ?, ?, ?)",
+                (consultation_id, request.tipo, document_hash, masked, "em_andamento", started_at),
+            )
+            connection.executemany(
+                "INSERT INTO consulta_sites (id, consulta_id, site_codigo, status) VALUES (?, ?, ?, ?)",
+                [(str(uuid.uuid4()), consultation_id, code, "pendente") for code in request.sites],
+            )
+            _record_event(connection, consultation_id, "consulta_iniciada", {
+                "sites": request.sites, "documento_mascarado": masked,
+            })
+            audit_payload = json.dumps(
+                [consultation_id, "iniciada", masked, request.sites, started_at, previous],
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "INSERT INTO consulta_auditoria (consulta_id, acao, documento_mascarado, sites_consultados, timestamp, hash_anterior, registro_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    consultation_id,
+                    "iniciada",
+                    masked,
+                    json.dumps(request.sites),
+                    started_at,
+                    previous,
+                    hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
+                ),
+            )
+            consultation = _serialize_consultation(connection, consultation_id)
     priority_sites = [code for code in PRIORITY_CNPJ_CAPTCHA_SITES if code in request.sites and request.tipo == "CNPJ"]
     ordered_sites = [*priority_sites, *(code for code in request.sites if code not in priority_sites)]
     for site_code in ordered_sites:
@@ -498,6 +695,170 @@ def create_consultation(request: ConsultationRequest):
         "status": consultation["status"],
         "consulta": consultation,
         "pasta_destino": str(consultation_directory.resolve()),
+    }
+
+
+@app.post("/api/v1/consultas/manual", status_code=201)
+def create_manual_portal_session(request: ManualPortalRequest):
+    digits = request.normalized_document()
+    masked = _mask_document(request.tipo, digits)
+    document_hash = hashlib.sha256(digits.encode("ascii")).hexdigest()
+    consultation_id = request.consulta_id
+    if consultation_id:
+        with closing(_connect()) as connection, connection:
+            existing = connection.execute(
+                "SELECT documento_tipo, documento_hash, iniciado_em FROM consultas WHERE id = ?",
+                (consultation_id,),
+            ).fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Consulta ativa não encontrada.")
+            if existing["documento_tipo"] != request.tipo or existing["documento_hash"] != document_hash:
+                raise HTTPException(status_code=409, detail="A pasta ativa pertence a outro documento.")
+            consultation_directory = find_consultation_directory(
+                existing["documento_hash"], existing["iniciado_em"], OUTPUT_ROOT
+            )
+            if consultation_directory is None:
+                raise HTTPException(status_code=404, detail="Pasta da consulta ativa não encontrada.")
+
+            existing_site = connection.execute(
+                "SELECT status FROM consulta_sites WHERE consulta_id = ? AND site_codigo = ?",
+                (consultation_id, request.site),
+            ).fetchone()
+            if existing_site is not None and existing_site["status"] == "sucesso":
+                raise HTTPException(status_code=409, detail="Este portal já foi concluído nesta consulta.")
+            if existing_site is None:
+                connection.execute(
+                    "INSERT INTO consulta_sites (id, consulta_id, site_codigo, status) VALUES (?, ?, ?, 'aguardando_manual')",
+                    (str(uuid.uuid4()), consultation_id, request.site),
+                )
+            else:
+                connection.execute(
+                    "UPDATE consulta_sites SET status = 'aguardando_manual', resultado = NULL "
+                    "WHERE consulta_id = ? AND site_codigo = ?",
+                    (consultation_id, request.site),
+                )
+            connection.execute(
+                "UPDATE consultas SET status = 'aguardando_manual' WHERE id = ?",
+                (consultation_id,),
+            )
+            _record_event(connection, consultation_id, "site_status", {
+                "site_codigo": request.site,
+                "status": "aguardando_manual",
+                "detalhe": "Portal manual adicionado à pasta ativa da consulta.",
+            })
+            timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+            previous_audit = connection.execute(
+                "SELECT registro_hash FROM consulta_auditoria ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            previous = previous_audit["registro_hash"] if previous_audit else None
+            audit_payload = json.dumps(
+                [consultation_id, "portal_manual_anexado", masked, request.site, timestamp, previous],
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "INSERT INTO consulta_auditoria (consulta_id, acao, documento_mascarado, sites_consultados, timestamp, hash_anterior, registro_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    consultation_id,
+                    "portal_manual_anexado",
+                    masked,
+                    json.dumps([request.site]),
+                    timestamp,
+                    previous,
+                    hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
+                ),
+            )
+            consultation = _serialize_consultation(connection, consultation_id)
+    else:
+        consultation_id = str(uuid.uuid4())
+        consultation_directory, started_at_value = create_consultation_directory(digits, OUTPUT_ROOT)
+        started_at = started_at_value.isoformat(timespec="seconds")
+        with closing(_connect()) as connection, connection:
+            last_audit = connection.execute(
+                "SELECT registro_hash FROM consulta_auditoria ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            previous = last_audit["registro_hash"] if last_audit else None
+            connection.execute(
+                "INSERT INTO consultas (id, documento_tipo, documento_hash, documento_mascarado, status, iniciado_em) VALUES (?, ?, ?, ?, ?, ?)",
+                (consultation_id, request.tipo, document_hash, masked, "aguardando_manual", started_at),
+            )
+            connection.execute(
+                "INSERT INTO consulta_sites (id, consulta_id, site_codigo, status) VALUES (?, ?, ?, ?)",
+                (str(uuid.uuid4()), consultation_id, request.site, "aguardando_manual"),
+            )
+            _record_event(connection, consultation_id, "consulta_iniciada", {
+                "sites": [request.site], "documento_mascarado": masked, "modo": "MANUAL",
+            })
+            audit_payload = json.dumps(
+                [consultation_id, "iniciada_manual", masked, [request.site], started_at, previous],
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "INSERT INTO consulta_auditoria (consulta_id, acao, documento_mascarado, sites_consultados, timestamp, hash_anterior, registro_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    consultation_id,
+                    "iniciada_manual",
+                    masked,
+                    json.dumps([request.site]),
+                    started_at,
+                    previous,
+                    hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
+                ),
+            )
+            consultation = _serialize_consultation(connection, consultation_id)
+    portal = next(site for site in SITE_CATALOG if site["codigo"] == request.site)
+    return {
+        "consulta_id": consultation_id,
+        "status": consultation["status"],
+        "consulta": consultation,
+        "pasta_destino": str(consultation_directory.resolve()),
+        "url": portal["url"],
+        "nome_pdf": f"{MANUAL_PDF_FILE_IDS[request.site]}.pdf",
+    }
+
+
+@app.post("/api/v1/consultas/{consultation_id}/sites/simples_nacional/manual")
+def continue_simples_nacional_manually(consultation_id: str):
+    with closing(_connect()) as connection, connection:
+        consultation = connection.execute(
+            "SELECT documento_tipo, status FROM consultas WHERE id = ?",
+            (consultation_id,),
+        ).fetchone()
+        site = connection.execute(
+            "SELECT status FROM consulta_sites WHERE consulta_id = ? AND site_codigo = 'simples_nacional'",
+            (consultation_id,),
+        ).fetchone()
+        if consultation is None or site is None:
+            raise HTTPException(status_code=404, detail="Consulta Simples Nacional não encontrada.")
+        if site["status"] != "erro":
+            raise HTTPException(status_code=409, detail="A contingência manual só pode ser aberta após falha da automação.")
+        connection.execute(
+            "UPDATE consulta_sites SET status = 'aguardando_manual', resultado = ? "
+            "WHERE consulta_id = ? AND site_codigo = 'simples_nacional'",
+            (json.dumps({"detalhe": "Automação interrompida; aguardando emissão manual do PDF oficial."}, ensure_ascii=False), consultation_id),
+        )
+        connection.execute(
+            "UPDATE consultas SET status = 'aguardando_manual' WHERE id = ?",
+            (consultation_id,),
+        )
+        _record_event(connection, consultation_id, "site_status", {
+            "site_codigo": "simples_nacional",
+            "status": "aguardando_manual",
+            "detalhe": "Abra o portal oficial e salve simples_nacional.pdf na pasta desta sessão.",
+        })
+        row = connection.execute(
+            "SELECT documento_hash, iniciado_em FROM consultas WHERE id = ?",
+            (consultation_id,),
+        ).fetchone()
+    directory = find_consultation_directory(row["documento_hash"], row["iniciado_em"], OUTPUT_ROOT)
+    if directory is None:
+        raise HTTPException(status_code=404, detail="Pasta da consulta não encontrada.")
+    portal = next(site for site in SITE_CATALOG if site["codigo"] == "simples_nacional")
+    return {
+        "consulta_id": consultation_id,
+        "status": "aguardando_manual",
+        "pasta_destino": str(directory.resolve()),
+        "url": portal["url"],
+        "nome_pdf": f"{MANUAL_PDF_FILE_IDS['simples_nacional']}.pdf",
     }
 
 
@@ -558,6 +919,67 @@ def download_site_pdf(consultation_id: str, site_code: str):
     if file_path.parent != consultation_directory.resolve() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Arquivo da certidão não encontrado.")
     return FileResponse(file_path, media_type="application/pdf", filename=file_path.name)
+
+
+@app.post("/api/v1/consultas/{consultation_id}/pdf/unir")
+def merge_consultation_pdfs(consultation_id: str, request: MergePdfsRequest):
+    with closing(_connect()) as connection:
+        row = connection.execute(
+            "SELECT documento_hash, iniciado_em FROM consultas WHERE id = ?",
+            (consultation_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada.")
+    directory = find_consultation_directory(row["documento_hash"], row["iniciado_em"], OUTPUT_ROOT)
+    if directory is None:
+        raise HTTPException(status_code=404, detail="Pasta da consulta não encontrada.")
+
+    resolved_directory = directory.resolve()
+    source_paths: list[Path] = []
+    for filename in request.arquivos:
+        if filename.casefold() == "certidoes_unificadas.pdf":
+            raise HTTPException(status_code=422, detail="O PDF unificado anterior não pode ser usado como origem.")
+        source = (directory / filename).resolve()
+        if source.parent != resolved_directory or not source.is_file():
+            raise HTTPException(status_code=404, detail=f"PDF não encontrado na pasta da sessão: {filename}")
+        try:
+            with source.open("rb") as handle:
+                if handle.read(5) != b"%PDF-":
+                    raise HTTPException(status_code=422, detail=f"Arquivo inválido ou ainda incompleto: {filename}")
+                reader = PdfReader(handle, strict=True)
+                if reader.is_encrypted:
+                    raise HTTPException(status_code=422, detail=f"PDF protegido por senha não pode ser unido: {filename}")
+                if len(reader.pages) == 0:
+                    raise HTTPException(status_code=422, detail=f"PDF sem páginas: {filename}")
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=f"Não foi possível ler o PDF {filename}.") from error
+        source_paths.append(source)
+
+    merged_path = directory / "certidoes_unificadas.pdf"
+    writer = PdfWriter()
+    try:
+        for source in source_paths:
+            writer.append(str(source))
+        temporary_path = directory / ".certidoes_unificadas.tmp.pdf"
+        with temporary_path.open("wb") as output:
+            writer.write(output)
+        writer.close()
+        if not temporary_path.read_bytes().startswith(b"%PDF-"):
+            temporary_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="Falha ao validar o PDF unificado.")
+        temporary_path.replace(merged_path)
+    except HTTPException:
+        raise
+    except Exception as error:
+        temporary_path = directory / ".certidoes_unificadas.tmp.pdf"
+        temporary_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Não foi possível unir os PDFs selecionados.") from error
+    finally:
+        writer.close()
+
+    return FileResponse(merged_path, media_type="application/pdf", filename=merged_path.name)
 
 
 def _open_directory(path: Path) -> None:
